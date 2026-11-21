@@ -1,0 +1,15 @@
+/.build/
+/.swiftpm/
+/dist/
+.DS_Store
+xcuserdata/
+*.app/
+*.xcarchive/
+*.dmg
+*.caf
+*.m4a
+*.wav
+*.aiff
+*.log
+*.mobileprovision
+*.p12
