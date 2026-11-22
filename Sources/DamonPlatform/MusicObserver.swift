@@ -20,7 +20,7 @@ public enum MusicObservationError: LocalizedError {
 
     public var errorDescription: String? {
         switch self {
-        case .rejected(-1743): "Music Automation permission denied. Enable Damon in System Settings > Privacy & Security > Automation."
+        case .rejected(-1743): "Music Automation permission denied. Enable RateCue in System Settings > Privacy & Security > Automation."
         case let .rejected(code): "Music could not be read (Apple event \(code))."
         case .unexpectedResponse: "Music returned an unrecognized playback state."
         case .changedDuringRead: "Track changed during observation; waiting for a stable reading."
@@ -109,6 +109,7 @@ public enum MusicObserver {
             let status: String
             var rateHz: Int?
             var bitDepth: Int?
+            var freshness: String?
         }
 
         let playbackState: String
@@ -150,12 +151,131 @@ public enum MusicObserver {
         let reading: FormatProbe.Panel? = switch panel?() {
         case .none: nil
         case .accessibilityDenied: .init(status: "accessibilityDenied")
+        case .unavailable: .init(status: "unavailable")
         case .noOpenPanel: .init(status: "noOpenPanel")
         case .unrecognizedFormat: .init(status: "unrecognizedFormat")
-        case let .reading(format): .init(status: "reported", rateHz: format.rate, bitDepth: format.bitDepth)
+        case let .reading(format): .init(status: "reported", rateHz: format.rate, bitDepth: format.bitDepth, freshness: "notEstablished")
         }
         guard try trackID() == initialID, try stillPlaying() else { throw MusicObservationError.changedDuringRead }
         return FormatProbe(playbackState: Playback.State.playing.rawValue, trackProperty: property, losslessPanel: reading)
+    }
+
+    enum FreshPanelError: LocalizedError, Equatable {
+        case notPlaying, accessibilityDenied, unavailable, alreadyOpen, unrecognizedFormat, timedOut
+
+        var errorDescription: String? {
+            switch self {
+            case .notPlaying: "Music must be playing before starting the panel check."
+            case .accessibilityDenied: "\(MusicFormatPanel.accessibilityGuidance) For CLI checks, also allow your terminal."
+            case .unavailable: "Music's Now Playing panel could not be observed reliably."
+            case .alreadyOpen: "Close Music's Lossless panel before starting the fresh-panel check."
+            case .unrecognizedFormat: "Music's open panel did not show one recognizable ALAC format."
+            case .timedOut: "The Lossless panel was not observed opening before the deadline."
+            }
+        }
+    }
+
+    public static func readFreshPanel(
+        pid: pid_t, expectedTrackID: String, onReady: @Sendable () -> Void
+    ) throws -> MusicFormatPanel.Reading {
+        let result = try probeFreshPanel(pid: pid, onReady: onReady, expectedTrackID: expectedTrackID)
+        guard let panel = result.losslessPanel, panel.status == "reported", let rate = panel.rateHz,
+              panel.freshness == "openedDuringProbe" else { throw FreshPanelError.unavailable }
+        return MusicFormatPanel.Reading(rate: rate, bitDepth: panel.bitDepth)
+    }
+
+    public static func readOpenPanel(pid: pid_t, expectedTrackID: String) throws -> MusicFormatPanel.Result {
+        let track = try property("pTrk")
+        let persistentID = try property("pPIS", in: track)
+        return try readOpenPanel(
+            expectedTrackID: expectedTrackID, trackID: { try get(persistentID, pid: pid).stringValue },
+            stillPlaying: { try playbackState(pid: pid) == .playing }, panel: { MusicFormatPanel.read(pid: pid) }
+        )
+    }
+
+    public static func readAutomaticPanel(pid: pid_t, expectedTrackID: String) throws -> MusicFormatPanel.Reading {
+        let track = try property("pTrk")
+        let persistentID = try property("pPIS", in: track)
+        return try MusicFormatPanel.readAutomatically(pid: pid) {
+            guard !expectedTrackID.isEmpty, try get(persistentID, pid: pid).stringValue == expectedTrackID,
+                  try playbackState(pid: pid) == .playing else { throw MusicObservationError.changedDuringRead }
+        }
+    }
+
+    static func readOpenPanel(
+        expectedTrackID: String, trackID: () throws -> String?, stillPlaying: () throws -> Bool,
+        panel: () -> MusicFormatPanel.Result
+    ) throws -> MusicFormatPanel.Result {
+        guard !expectedTrackID.isEmpty, try trackID() == expectedTrackID, try stillPlaying() else {
+            throw MusicObservationError.changedDuringRead
+        }
+        let result = panel()
+        guard try trackID() == expectedTrackID, try stillPlaying() else { throw MusicObservationError.changedDuringRead }
+        return result
+    }
+
+    static func probeFreshPanel(pid: pid_t, onReady: () -> Void, expectedTrackID: String? = nil) throws -> FormatProbe {
+        guard try playbackState(pid: pid) == .playing else { throw FreshPanelError.notPlaying }
+        let track = try property("pTrk")
+        let persistentID = try property("pPIS", in: track)
+        let rateProperty = try property("pSRt", in: track)
+        return try probeFreshPanel(
+            trackID: { try get(persistentID, pid: pid).stringValue },
+            trackRate: { Int(try get(rateProperty, pid: pid).int32Value) },
+            panel: { MusicFormatPanel.read(pid: pid) },
+            stillPlaying: { try playbackState(pid: pid) == .playing },
+            now: { ProcessInfo.processInfo.systemUptime }, sleep: Thread.sleep(forTimeInterval:),
+            onReady: onReady, expectedTrackID: expectedTrackID, shouldContinue: { !Task.isCancelled }
+        )
+    }
+
+    static func probeFreshPanel(
+        trackID: () throws -> String?, trackRate: () throws -> Int, panel: () -> MusicFormatPanel.Result,
+        stillPlaying: () throws -> Bool, now: () -> TimeInterval, sleep: (TimeInterval) -> Void,
+        onReady: () -> Void, timeout: TimeInterval = 15, expectedTrackID: String? = nil,
+        shouldContinue: () -> Bool = { true }
+    ) throws -> FormatProbe {
+        guard shouldContinue() else { throw CancellationError() }
+        guard let initialID = try trackID(), !initialID.isEmpty, try stillPlaying() else {
+            throw FreshPanelError.notPlaying
+        }
+        guard expectedTrackID == nil || expectedTrackID == initialID else { throw MusicObservationError.changedDuringRead }
+        func checkTrack() throws {
+            guard shouldContinue() else { throw CancellationError() }
+            guard try trackID() == initialID, try stillPlaying() else { throw MusicObservationError.changedDuringRead }
+        }
+        let initialPanel = panel()
+        try checkTrack()
+        switch initialPanel {
+        case .noOpenPanel: break
+        case .accessibilityDenied: throw FreshPanelError.accessibilityDenied
+        case .unavailable: throw FreshPanelError.unavailable
+        case .reading, .unrecognizedFormat: throw FreshPanelError.alreadyOpen
+        }
+        onReady()
+        let deadline = now() + timeout
+        while now() < deadline {
+            try checkTrack()
+            let observation = panel()
+            try checkTrack()
+            guard now() <= deadline else { break }
+            switch observation {
+            case let .reading(format):
+                let result = try probePlayingFormat(trackID: trackID, trackRate: trackRate, panel: { .reading(format) },
+                                                    stillPlaying: stillPlaying)
+                try checkTrack()
+                guard now() <= deadline else { throw FreshPanelError.timedOut }
+                return FormatProbe(playbackState: result.playbackState, trackProperty: result.trackProperty,
+                                   losslessPanel: .init(status: "reported", rateHz: format.rate, bitDepth: format.bitDepth,
+                                                        freshness: "openedDuringProbe"))
+            case .noOpenPanel:
+                sleep(min(0.2, max(0, deadline - now())))
+            case .accessibilityDenied: throw FreshPanelError.accessibilityDenied
+            case .unavailable: throw FreshPanelError.unavailable
+            case .unrecognizedFormat: throw FreshPanelError.unrecognizedFormat
+            }
+        }
+        throw FreshPanelError.timedOut
     }
 
     public static func requestPermission(pid: pid_t, askIfNeeded: Bool = true) -> OSStatus {

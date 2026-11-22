@@ -29,6 +29,12 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let menu = NSMenu()
     private var refresh: Task<Void, Never>?
+    private var activationObserver: NSObjectProtocol?
+    private let audioRefresh = AudioRefreshGate()
+    private lazy var audioChanges = AudioChangeMonitor(
+        onChange: { [weak self] in self?.audioRefresh.signal() },
+        onError: { [weak self] message in self?.appendLog(message) }
+    )
     private var model = AlignmentMachine()
     private var epoch = Epoch(playback: 0, route: 0)
     private var playbackBoundary: TimeInterval = 0
@@ -38,6 +44,12 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var previousDevice: OutputDevice?
     private var previousMusicPID: pid_t?
     private var currentFormat = Format()
+    private var panelSnapshot: PanelFormatSnapshot?
+    private var panelTask: Task<Void, Never>?
+    private var panelPrompt: String?
+    private var automaticPanelTask: Task<Void, Never>?
+    private var automaticPanelAttemptEpoch: Epoch?
+    private var automaticPanelStatus: String?
     private var lastMessage = ""
     private var permissionMessage: String?
     private var settingsError: String?
@@ -67,20 +79,36 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         menu.delegate = self
         item.menu = menu
+        activationObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.handleApplicationActivation()
+            }
+        }
+        audioChanges.start()
         updateButton()
         refresh = Task { [weak self] in
             while let self, !Task.isCancelled {
+                let version = self.audioRefresh.version
                 await self.tick()
                 let interval = self.model.state == .aligning ? 50 :
                     self.previous?.playback?.state == .playing ? 300 :
                     self.automation && self.previous?.playback != nil ? 500 : 1_000
-                try? await Task.sleep(for: .milliseconds(interval))
+                await self.audioRefresh.wait(since: version, milliseconds: interval)
             }
         }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         refresh?.cancel()
+        panelTask?.cancel()
+        automaticPanelTask?.cancel()
+        if let activationObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(activationObserver)
+        }
+        audioRefresh.stop()
+        audioChanges.stop()
         verifier.stop()
     }
 
@@ -90,20 +118,31 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let enabled = automation
         let folder = approvedFolder
         let generation = preferenceGeneration
+        let audioVersion = audioRefresh.version
         let sample = await Task.detached {
             PlaybackSample.collect(pid: pid, automation: enabled, folder: folder, includeRateEstimate: true)
         }.value
-        guard !Task.isCancelled, reloadSettings(), generation == preferenceGeneration else { return }
+        guard !Task.isCancelled, reloadSettings(), generation == preferenceGeneration, audioVersion == audioRefresh.version else { return }
         let formatChanged = previous?.format != sample.format
         let repeatOrSeek = if let old = previous?.playback?.position, let new = sample.playback?.position {
             old - new > 0.5 && new >= 0 && new < 1
         } else { false }
         let playbackChanged = previous?.playback?.trackID != sample.playback?.trackID
             || previous?.playback?.state != sample.playback?.state || previousMusicPID != pid || formatChanged || repeatOrSeek
+        if previous?.playback?.reportedRate != sample.playback?.reportedRate {
+            automaticPanelTask?.cancel()
+            automaticPanelAttemptEpoch = nil
+            automaticPanelStatus = nil
+            panelSnapshot = nil
+        }
         let preferred = sample.preferredOutput(uid: preferredUID)
+        audioChanges.update(preferred: preferred, musicPID: pid)
         let routeChanged = previous?.route != sample.route || previousDevice?.objectID != preferred?.objectID
             || previousDevice?.uid != preferred?.uid || appliedPreferenceGeneration != generation
         if playbackChanged || routeChanged || previous == nil {
+            automaticPanelTask?.cancel()
+            automaticPanelStatus = nil
+            panelSnapshot = nil
             writeWarning = nil
             observedTrackChange = if let old = previous?.playback?.trackID, let new = sample.playback?.trackID {
                 old != new
@@ -180,6 +219,8 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             appendLog(message)
             lastMessage = message
         }
+        clearPanelWhileMusicIsActive()
+        scheduleAutomaticPanelRead()
         updateButton()
     }
 
@@ -199,10 +240,17 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 preferenceGeneration += 1
                 permissionMessage = nil
             }
+            if next.invalidatesAutomaticPanelRead(comparedTo: settings) {
+                automaticPanelTask?.cancel()
+                automaticPanelAttemptEpoch = nil
+                automaticPanelStatus = nil
+                if next.monitorMusic != automation { panelSnapshot = nil }
+            }
             settings = next
             settingsError = nil
             return true
         } catch {
+            automaticPanelTask?.cancel()
             let message = error.localizedDescription
             if settingsError != message { appendLog(message) }
             settingsError = message
@@ -216,7 +264,7 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             try store.apply([edit])
             if reloadSettings() { updateButton() }
         } catch {
-            alert("Could not update Damon preferences", detail: error.localizedDescription)
+            alert("Could not update RateCue preferences", detail: error.localizedDescription)
         }
     }
 
@@ -231,36 +279,53 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return model.state.rawValue
     }
 
+    private func formatDisplay() -> FormatDisplay {
+        let musicActive = NSWorkspace.shared.frontmostApplication?.bundleIdentifier == musicBundleID
+        return FormatDisplay(verified: currentFormat, playback: previous?.playback, panel: panelSnapshot, epoch: epoch,
+                             suppressPanel: settings.autoReadMusicPanel && musicActive)
+    }
+
     private func updateButton() {
         guard let button = item.button else { return }
-        let display = FormatDisplay(verified: currentFormat, playback: previous?.playback)
+        let display = formatDisplay()
         let warning = [.unavailable, .failed, .drift, .unsupportedRate, .unsupportedRoute, .unavailableReadback].contains(model.state)
             || writeWarning != nil || verifier.outcome == .failed
-        let title = display.statusBarTitle(showRate: showRate, showDepth: showDepth, warning: warning)
+        let title = if let panelPrompt {
+            NSAttributedString(string: panelPrompt)
+        } else {
+            display.statusBarTitle(showRate: showRate, showDepth: showDepth, warning: warning)
+        }
         if !button.attributedTitle.isEqual(to: title) { button.attributedTitle = title }
         button.toolTip = "\(display.certainty.rawValue) • \(status(sample: previous))"
-        button.setAccessibilityLabel("Damon: \(title.string). \(display.certainty.rawValue).")
+        button.setAccessibilityLabel("RateCue: \(title.string). \(display.certainty.rawValue).")
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         let sample = previous
         let preferred = previousDevice
-        let display = FormatDisplay(verified: currentFormat, playback: sample?.playback)
+        let display = formatDisplay()
         menu.removeAllItems()
-        append("Damon")
+        append("RateCue")
         append("Preferred Device: " + (preferred?.name ?? (preferredUID == nil ? "Not selected" : "Unavailable")))
         let active = sample?.activeOutputs ?? []
         append("Active Output: " + (active.isEmpty ? "Unconfirmed" : active.map(\.name).joined(separator: ", ")))
-        let trackRate = display.format.rate.map { (display.certainty == .estimated ? "≈" : "") + "\($0) Hz" } ?? "—"
+        let trackRate = display.format.rate.map {
+            ((display.certainty == .estimated || display.certainty == .panelSnapshot) ? "≈" : "") + "\($0) Hz"
+        } ?? "—"
         let trackDepth = display.format.depth.map { "\($0)-bit" } ?? "—"
         append("Track Format: \(trackRate) / \(trackDepth)")
         append("Confidence: \(display.certainty.rawValue)")
+        if settings.autoReadMusicPanel, let automaticPanelStatus {
+            append("Automatic depth: \(automaticPanelStatus)")
+        }
         append("Preferred Device Rate: " + (preferred?.nominalRate.map { "\($0) Hz" } ?? "—"))
         append("Status: \(status(sample: sample))")
         if let sample, sample.message != status(sample: sample) { append("Music: \(sample.message)") }
         menu.addItem(.separator())
         append("Show Sample Rate", action: #selector(toggleRate)).state = showRate ? .on : .off
         append("Show Bit Depth", action: #selector(toggleDepth)).state = showDepth ? .on : .off
+        append("Automatically Read Music Panel (Experimental)", action: #selector(toggleAutomaticPanelRead)).state =
+            settings.autoReadMusicPanel ? .on : .off
         append("Auto Switch Sample Rate", action: #selector(toggleAutomatic)).state = automatic ? .on : .off
         append("Monitor Apple Music", action: #selector(toggleAutomation)).state = automation ? .on : .off
         append("Choose Authorized Local Audio…", action: #selector(chooseLocalAudio))
@@ -293,13 +358,22 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         verification.addItem(NSMenuItem(title: "Digital sample integrity not established", action: nil, keyEquivalent: ""))
         append("Verification Status").submenu = verification
         append("Logs…", action: #selector(showLogs))
+        append("Copy Diagnostics", action: #selector(copyDiagnostics))
         append("Qualification Snapshot…", action: #selector(showQualificationSnapshot))
-        append("Read Open Music Lossless Panel…", action: #selector(readMusicFormatPanel))
+        let panelAvailable = panelTask == nil && automaticPanelTask == nil
+        append("Read Open Music Lossless Panel…", action: panelAvailable ? #selector(readMusicFormatPanel) : nil)
+        append(panelAvailable ? "Read Fresh Music Lossless Panel…" : "Reading Music Lossless Panel…",
+               action: panelAvailable ? #selector(readFreshMusicFormatPanel) : nil)
+        append("Accessibility Access…", action: #selector(showAccessibilityAccess))
+        menu.addItem(.separator())
+        append("About RateCue…", action: #selector(showAbout))
+        append("Help…", action: #selector(showHelp))
+        append("Credits…", action: #selector(showCredits))
         menu.addItem(.separator())
         let login = SMAppService.mainApp.status
         append("Launch at Login", action: #selector(toggleLogin)).state = login == .enabled ? .on : login == .requiresApproval ? .mixed : .off
         append("Check for Updates…", action: #selector(checkForUpdates))
-        append("Quit Damon", action: #selector(quit), key: "q")
+        append("Quit RateCue", action: #selector(quit), key: "q")
     }
 
     @discardableResult
@@ -321,6 +395,26 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func toggleDepth() {
         updatePreference(.showBitDepth(!showDepth))
+    }
+
+    @objc private func toggleAutomaticPanelRead() {
+        if settings.autoReadMusicPanel {
+            updatePreference(.autoReadMusicPanel(false))
+            return
+        }
+        let prompt = NSAlert()
+        prompt.messageText = "Automatically read Music's Lossless panel?"
+        prompt.informativeText = """
+            This experimental feature opens and closes Music's Lossless panel for a playing track when Music is not active. It clears the snapshot while Music is active, skips a panel that is already open, and may leave the panel open if playback or Music's interface changes.
+
+            Music's Now Playing view must be available and RateCue needs Accessibility access. The result can be stale, remains amber and unverified, and never authorizes a DAC rate change.
+            """
+        prompt.addButton(withTitle: "Enable Experimental Reading")
+        prompt.addButton(withTitle: "Cancel")
+        NSApp.activate()
+        if prompt.runModal() == .alertFirstButtonReturn {
+            updatePreference(.autoReadMusicPanel(true))
+        }
     }
 
     @objc private func toggleAutomatic() {
@@ -359,7 +453,7 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func chooseLocalAudio() {
         let panel = NSOpenPanel()
         panel.title = "Authorize inspection of local stereo lossless files"
-        panel.message = "Choose one fixture file or a dedicated folder. Damon checks only the file associated with the current Music track."
+        panel.message = "Choose one fixture file or a dedicated folder. RateCue checks only the file associated with the current Music track."
         panel.canChooseDirectories = true
         panel.canChooseFiles = true
         panel.canCreateDirectories = false
@@ -395,7 +489,24 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func showLogs() {
-        alert("Damon session diagnostics", detail: logs.isEmpty ? "No events yet." : logs.suffix(16).joined(separator: "\n"))
+        alert("RateCue session diagnostics", detail: logs.isEmpty ? "No events yet." : logs.suffix(16).joined(separator: "\n"))
+    }
+
+    @objc private func copyDiagnostics() {
+        let display = formatDisplay()
+        let text = """
+            Track format: \(display.statusBarTitle(showRate: true, showDepth: true, warning: false).string)
+            Confidence: \(display.certainty.rawValue)
+            Music monitoring: \(automation ? "on" : "off")
+            Accessibility access: \(MusicFormatPanel.hasAccessibilityAccess ? "enabled" : "not enabled")
+            Automatic panel reading: \(settings.autoReadMusicPanel ? "on" : "off")
+            Automatic depth: \(automaticPanelStatus ?? "No automatic check result")
+            Status: \(status(sample: previous))
+            """
+        NSPasteboard.general.clearContents()
+        if !NSPasteboard.general.setString(text, forType: .string) {
+            alert("Could not copy diagnostics", detail: "The clipboard could not accept the diagnostic text.")
+        }
     }
 
     @objc private func showQualificationSnapshot() {
@@ -423,7 +534,7 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             Preferred Device Rate: \(deviceRate)
             """
         let prompt = NSAlert()
-        prompt.messageText = "Damon qualification snapshot"
+        prompt.messageText = "RateCue qualification snapshot"
         prompt.informativeText = text
         prompt.addButton(withTitle: "Done")
         prompt.addButton(withTitle: "Copy")
@@ -442,7 +553,7 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func saveQualificationSnapshot(_ snapshot: QualificationSnapshot) {
         let panel = NSSavePanel()
-        panel.nameFieldStringValue = "Damon-qualification.json"
+        panel.nameFieldStringValue = "RateCue-qualification.json"
         panel.begin { [weak self] response in
             guard response == .OK, let url = panel.url else { return }
             do {
@@ -456,27 +567,225 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    @objc private func readMusicFormatPanel() {
-        guard let pid = NSRunningApplication.runningApplications(withBundleIdentifier: musicBundleID).first?.processIdentifier else {
-            alert("Music is not open", detail: "Open Music and its Now Playing Lossless panel first.")
+    private func handleApplicationActivation() {
+        guard settings.autoReadMusicPanel else { return }
+        clearPanelWhileMusicIsActive()
+        updateButton()
+        audioRefresh.signal()
+    }
+
+    private func clearPanelWhileMusicIsActive() {
+        guard settings.autoReadMusicPanel,
+              NSWorkspace.shared.frontmostApplication?.bundleIdentifier == musicBundleID else { return }
+        // A visible Music panel can retain the previous track's depth across a change.
+        panelSnapshot = nil
+        automaticPanelTask?.cancel()
+        automaticPanelAttemptEpoch = nil
+        automaticPanelStatus = "Waiting until Music is not active."
+    }
+
+    private func scheduleAutomaticPanelRead() {
+        guard settings.autoReadMusicPanel, automation, panelTask == nil, automaticPanelTask == nil,
+              automaticPanelAttemptEpoch != epoch, panelSnapshot == nil,
+              currentFormat.rate == nil, currentFormat.depth == nil,
+              let pid = previousMusicPID, let playback = previous?.playback, playback.state == .playing,
+              let trackID = playback.trackID else { return }
+        guard let music = NSRunningApplication(processIdentifier: pid) else {
+            automaticPanelStatus = "Music is unavailable."
             return
         }
-        Task {
-            let reading = await Task.detached { MusicFormatPanel.read(pid: pid) }.value
+        guard !music.isActive else {
+            automaticPanelStatus = "Waiting until Music is not active."
+            return
+        }
+        let selectedEpoch = epoch
+        automaticPanelAttemptEpoch = selectedEpoch
+        automaticPanelStatus = "Reading Music's panel…"
+        automaticPanelTask = Task { [weak self] in
+            let worker = Task.detached {
+                try MusicObserver.readAutomaticPanel(pid: pid, expectedTrackID: trackID)
+            }
+            let outcome = await withTaskCancellationHandler { await worker.result } onCancel: { worker.cancel() }
+            guard let self else { return }
+            self.automaticPanelTask = nil
+            defer { self.audioRefresh.signal() }
+            guard !Task.isCancelled, self.settings.autoReadMusicPanel,
+                  self.epoch == selectedEpoch, self.previousMusicPID == pid else { return }
+            switch outcome {
+            case let .success(reading):
+                self.acceptPanelReading(reading, epoch: selectedEpoch, trackID: trackID, pid: pid, automatic: true)
+            case let .failure(error):
+                let message = "\(error.localizedDescription) Music's panel may remain open."
+                self.automaticPanelStatus = message
+                self.appendLog("Automatic panel read: \(message)")
+                self.updateButton()
+            }
+        }
+    }
+
+    @objc private func readMusicFormatPanel() {
+        guard panelTask == nil, automaticPanelTask == nil else { return }
+        guard automation, let pid = previousMusicPID, let playback = previous?.playback, playback.state == .playing,
+              let trackID = playback.trackID else {
+            alert("Music is not being monitored", detail: "Enable Monitor Apple Music and start a track before reading the panel.")
+            return
+        }
+        let selectedEpoch = epoch
+        panelSnapshot = nil
+        updateButton()
+        panelTask = Task {
+            defer {
+                panelTask = nil
+                audioRefresh.signal()
+            }
+            let outcome = await Task.detached { () -> Result<MusicFormatPanel.Result, Error> in
+                Result { try MusicObserver.readOpenPanel(pid: pid, expectedTrackID: trackID) }
+            }.value
+            let reading: MusicFormatPanel.Result
+            switch outcome {
+            case let .success(result): reading = result
+            case let .failure(error):
+                alert("Music panel check failed", detail: error.localizedDescription)
+                return
+            }
             let text: String
             switch reading {
             case .accessibilityDenied:
-                text = "This optional diagnostic needs Accessibility permission in System Settings > Privacy & Security. Damon only reads the panel and does not open or control it."
+                text = "\(MusicFormatPanel.accessibilityGuidance) This manual check only reads the panel."
+            case .unavailable:
+                text = "Music's Now Playing view could not be observed reliably. Make the Now Playing view visible and try again."
             case .noOpenPanel:
                 text = "No readable Lossless panel was found. Open the Lossless badge in Music's Now Playing view and leave the panel open while requesting this diagnostic."
             case .unrecognizedFormat:
                 text = "The open panel did not expose exactly one recognizable ALAC format."
             case let .reading(format):
                 let depth = format.bitDepth.map { "\($0)-bit" } ?? "bit depth not shown"
-                text = "\(format.rate) Hz ALAC, \(depth). This is a Music panel reading only. It does not authorize a rate change."
+                guard format.bitDepth != nil else {
+                    alert("Music Lossless panel diagnostic", detail: "\(format.rate) Hz ALAC, \(depth). RateCue will not infer a bit depth.")
+                    return
+                }
+                let prompt = NSAlert()
+                prompt.messageText = "Music reports \(format.rate) Hz / \(depth)"
+                prompt.informativeText = """
+                    Music's panel can retain a previous track's format. Only display this snapshot if you just opened the panel on the current track.
+
+                    RateCue will show it in amber as unverified. It will not authorize a DAC rate change.
+                    """
+                prompt.addButton(withTitle: "Display Estimate")
+                prompt.addButton(withTitle: "Cancel")
+                NSApp.activate()
+                if prompt.runModal() == .alertFirstButtonReturn {
+                    acceptPanelReading(format, epoch: selectedEpoch, trackID: trackID, pid: pid)
+                }
+                return
             }
             alert("Music Lossless panel diagnostic", detail: text)
         }
+    }
+
+    @objc private func showAccessibilityAccess() {
+        if MusicFormatPanel.hasAccessibilityAccess {
+            alert("Accessibility access enabled", detail: "macOS reports that this running RateCue build can access Music's interface. Manual panel checks only read it; the opt-in experimental reader can also open and close its Lossless panel.")
+            return
+        }
+        let prompt = NSAlert()
+        prompt.messageText = "Accessibility access is not enabled"
+        prompt.informativeText = """
+            RateCue needs Accessibility access to read Music's Lossless panel. This permission can allow an app to control other apps. Manual panel checks only read it; the opt-in experimental reader can also open and close Music's Lossless panel.
+
+            Select Request Access to let macOS show its permission prompt. \(MusicFormatPanel.accessibilityGuidance)
+            """
+        prompt.addButton(withTitle: "Request Access")
+        prompt.addButton(withTitle: "Cancel")
+        NSApp.activate()
+        if prompt.runModal() == .alertFirstButtonReturn {
+            MusicFormatPanel.requestAccessibilityAccess()
+        }
+    }
+
+    @objc private func readFreshMusicFormatPanel() {
+        guard panelTask == nil, automaticPanelTask == nil else { return }
+        let instructions = NSAlert()
+        instructions.messageText = "Read Music's Lossless Panel"
+        instructions.informativeText = """
+            Leave the current track playing and close Music's Lossless panel. Select Start, then open the Lossless badge in Music when the menu bar says “Open Music badge”.
+
+            If Music explicitly shows bit depth, RateCue displays it in amber as an unverified snapshot. It clears when playback or the output route changes and never changes the DAC setting.
+            """
+        instructions.addButton(withTitle: "Start")
+        instructions.addButton(withTitle: "Cancel")
+        NSApp.activate()
+        guard instructions.runModal() == .alertFirstButtonReturn else { return }
+        guard automation, let pid = previousMusicPID, let playback = previous?.playback, playback.state == .playing,
+              let trackID = playback.trackID else {
+            alert("Music is not being monitored", detail: "Enable Monitor Apple Music and start a track before reading the panel.")
+            return
+        }
+        let selectedEpoch = epoch
+        panelSnapshot = nil
+        panelPrompt = "Checking Music…"
+        updateButton()
+        let notifyReady: @Sendable () -> Void = { [weak self] in
+            guard let self else { return }
+            Task { @MainActor in
+                guard self.panelTask != nil, self.epoch == selectedEpoch else { return }
+                self.panelPrompt = "Open Music badge"
+                self.updateButton()
+            }
+        }
+        panelTask = Task { [weak self] in
+            let worker = Task.detached {
+                try MusicObserver.readFreshPanel(pid: pid, expectedTrackID: trackID, onReady: notifyReady)
+            }
+            let outcome = await withTaskCancellationHandler { await worker.result } onCancel: { worker.cancel() }
+            guard let self else { return }
+            self.panelTask = nil
+            self.panelPrompt = nil
+            guard !Task.isCancelled else { self.updateButton(); return }
+            guard self.automation, self.epoch == selectedEpoch, self.previousMusicPID == pid,
+                  self.previous?.playback?.state == .playing, self.previous?.playback?.trackID == trackID else {
+                self.updateButton()
+                self.alert("Music changed during the panel check", detail: "No bit-depth snapshot was saved. Start the check again on the current track.")
+                return
+            }
+            switch outcome {
+            case let .success(reading):
+                self.acceptPanelReading(reading, epoch: selectedEpoch, trackID: trackID, pid: pid)
+            case let .failure(error):
+                self.updateButton()
+                self.alert("Music panel check failed", detail: error.localizedDescription)
+            }
+        }
+    }
+
+    private func acceptPanelReading(
+        _ reading: MusicFormatPanel.Reading, epoch selectedEpoch: Epoch, trackID: String, pid: pid_t, automatic: Bool = false
+    ) {
+        func fail(_ title: String, _ detail: String) {
+            updateButton()
+            if automatic {
+                automaticPanelStatus = detail
+                appendLog("Automatic panel read: \(detail)")
+            } else {
+                alert(title, detail: detail)
+            }
+        }
+        guard automation, epoch == selectedEpoch, previousMusicPID == pid,
+              previous?.playback?.state == .playing, previous?.playback?.trackID == trackID else {
+            fail("Music changed during the panel check", "No bit-depth snapshot was saved because playback changed.")
+            return
+        }
+        guard let depth = reading.bitDepth else {
+            fail("Bit depth not shown", "Music's panel did not report a bit depth. RateCue will not infer one.")
+            return
+        }
+        if let rate = previous?.playback?.reportedRate, rate != reading.rate {
+            fail("Music format readings disagree", "The panel and track sample-rate readings differ, so no bit-depth snapshot was saved.")
+            return
+        }
+        panelSnapshot = PanelFormatSnapshot(format: Format(rate: reading.rate, depth: depth), epoch: selectedEpoch, trackID: trackID)
+        if automatic { automaticPanelStatus = "Unverified Music panel snapshot." }
+        updateButton()
     }
 
     @objc private func toggleLogin() {
@@ -495,7 +804,54 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func checkForUpdates() {
-        alert("Local development build", detail: "No update service is configured. Rebuild Damon from this workspace for updates.")
+        alert("Local development build", detail: "No update service is configured. Rebuild RateCue from this workspace for updates.")
+    }
+
+    @objc private func showAbout() {
+        do {
+            let info = try AppInformation()
+            let credits = try AppInformation.credits()
+            let formatted = NSAttributedString(
+                string: credits,
+                attributes: [.font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize)]
+            )
+            NSApp.activate()
+            NSApp.orderFrontStandardAboutPanel(options: [
+                .applicationName: info.name,
+                .applicationVersion: info.version,
+                .version: info.build,
+                .credits: formatted
+            ])
+        } catch {
+            alert("About RateCue is unavailable", detail: error.localizedDescription)
+        }
+    }
+
+    @objc private func showHelp() {
+        alert("RateCue Help", detail: """
+            Getting started
+            Open Music, enable Monitor Apple Music, and select your preferred output device in the RateCue menu. Grant Music Automation access when asked; if access was denied, review System Settings > Privacy & Security > Automation.
+
+            Reading the display
+            Green indicates a qualified local source format. Amber with ≈ is an unverified Music-reported rate or panel snapshot; — means unknown. Status can still say Unknown Format when an amber estimate is displayed. A matching rate alone does not prove bit-perfect playback.
+
+            Music panel and permissions
+            Use Accessibility Access to check or request permission. Open Music's Lossless panel and choose Read Open Music Lossless Panel to display a user-confirmed amber snapshot. Automatically Read Music Panel is opt-in and experimental: it clears the snapshot while Music has focus, then tries again after you switch away. The panel may be stale. Use Copy Diagnostics to copy a status summary.
+
+            Local files and verification
+            Use Choose Authorized Local Audio to inspect a file or a dedicated fixture folder. Catalog source depth and automatic catalog switching remain unqualified. Camera and microphone verification requires a calibrated device profile and separate permission. Check for Updates is a placeholder in this build.
+
+            Build and test
+            On macOS 15 or later with Xcode 16 and Swift 6, run sh Scripts/check.sh from the project folder. Use the bundled executable with --help for CLI commands.
+            """)
+    }
+
+    @objc private func showCredits() {
+        do {
+            alert("RateCue Credits", detail: try AppInformation.credits())
+        } catch {
+            alert("Credits are unavailable", detail: error.localizedDescription)
+        }
     }
 
     @objc private func quit() { NSApp.terminate(self) }

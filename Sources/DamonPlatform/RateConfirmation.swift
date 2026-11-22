@@ -63,7 +63,7 @@ public enum RateConfirmation {
             if remaining <= 0 { return .failed("Could not reconfirm playback and route after readback: \(sample.message)") }
             sleep(min(0.02, remaining))
         }
-        return .failed("Damon preferences changed or the write was cancelled before verification.")
+        return .failed("RateCue preferences changed or the write was cancelled before verification.")
     }
 
     static func canonical(_ url: URL) -> URL {

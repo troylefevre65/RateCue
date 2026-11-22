@@ -100,13 +100,19 @@ public enum AudioHardware {
         }.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
     }
 
-    public static func confirmedMusicOutputs(pid: pid_t) -> [AudioObjectID]? {
+    static func musicProcessObjects(pid: pid_t) -> [AudioObjectID]? {
         guard let processes = array(system, kAudioHardwarePropertyProcessObjectList, zero: AudioObjectID(0)) else { return nil }
+        return processes.filter { process in
+            var processPID: pid_t = 0
+            return read(process, kAudioProcessPropertyPID, into: &processPID) && pid == processPID
+                && string(process, kAudioProcessPropertyBundleID) == "com.apple.Music"
+        }
+    }
+
+    public static func confirmedMusicOutputs(pid: pid_t) -> [AudioObjectID]? {
+        guard let processes = musicProcessObjects(pid: pid) else { return nil }
         var matches: [AudioObjectID] = []
         for process in processes {
-            var processPID: pid_t = 0
-            guard read(process, kAudioProcessPropertyPID, into: &processPID), pid == processPID,
-                  string(process, kAudioProcessPropertyBundleID) == "com.apple.Music" else { continue }
             var running: UInt32 = 0
             guard read(process, kAudioProcessPropertyIsRunningOutput, into: &running), running != 0 else { continue }
             guard let outputs = array(process, kAudioProcessPropertyDevices, scope: kAudioDevicePropertyScopeOutput,

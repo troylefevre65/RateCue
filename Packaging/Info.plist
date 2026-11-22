@@ -4,18 +4,19 @@
 <dict>
     <key>CFBundleExecutable</key><string>Damon</string>
     <key>CFBundleIdentifier</key><string>org.damon.BitStreamManager</string>
-    <key>CFBundleName</key><string>Damon</string>
+    <key>CFBundleName</key><string>RateCue</string>
+    <key>CFBundleDisplayName</key><string>RateCue</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>0.1.0</string>
     <key>CFBundleVersion</key><string>1</string>
     <key>LSMinimumSystemVersion</key><string>15.0</string>
     <key>LSUIElement</key><true/>
     <key>NSAppleEventsUsageDescription</key>
-    <string>Damon reads Apple Music playback state and track format metadata. Explicit CLI commands can also control playback for testing.</string>
+    <string>RateCue reads Music playback state, track identity, sample rate, and the location of authorized local files. Explicit CLI commands can control playback for testing.</string>
     <key>NSCameraUsageDescription</key>
-    <string>Damon reads the calibrated DAC indicator lights to check its locked rate. It does not save video.</string>
+    <string>RateCue reads the calibrated DAC indicator lights to check its locked rate. It does not save video.</string>
     <key>NSMicrophoneUsageDescription</key>
-    <string>Damon listens for the calibrated DAC relay click. It does not save audio.</string>
+    <string>RateCue listens for the calibrated DAC relay click. It does not save audio.</string>
     <key>DamonQualifiedLocalOutputs</key><array/>
     <key>DamonSensorProfiles</key><array/>
 </dict>

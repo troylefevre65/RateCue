@@ -6,12 +6,17 @@ public struct DamonSettings: Encodable, Equatable, Sendable {
     public var authorizedAudioPath: String?
     public var monitorMusic = false
     public var autoSwitch = false
+    public var autoReadMusicPanel = false
     public var showSampleRate = true
     public var showBitDepth = true
 
     public var authorizedAudio: URL? { authorizedAudioPath.map { URL(fileURLWithPath: $0) } }
 
     public init() {}
+
+    public func invalidatesAutomaticPanelRead(comparedTo previous: DamonSettings) -> Bool {
+        monitorMusic != previous.monitorMusic || autoReadMusicPanel != previous.autoReadMusicPanel
+    }
 }
 
 public enum SettingEdit: Sendable {
@@ -19,6 +24,7 @@ public enum SettingEdit: Sendable {
     case localAudio(URL?)
     case monitorMusic(Bool)
     case autoSwitch(Bool)
+    case autoReadMusicPanel(Bool)
     case showSampleRate(Bool)
     case showBitDepth(Bool)
 }
@@ -31,12 +37,13 @@ public struct SettingsStore {
     }
 
     public struct SyncError: LocalizedError {
-        public var errorDescription: String? { "Unable to synchronize Damon's preferences." }
+        public var errorDescription: String? { "Unable to synchronize RateCue preferences." }
     }
 
     public func read() throws -> DamonSettings {
         guard CFPreferencesAppSynchronize(domain as CFString) else { throw SyncError() }
-        let keys = ["preferredUID", "approvedAudioPath", "approvedFolder", "observeMusic", "automatic", "showRate", "showDepth"]
+        let keys = ["preferredUID", "approvedAudioPath", "approvedFolder", "observeMusic", "automatic",
+                    "autoReadMusicPanel", "showRate", "showDepth"]
         let values = CFPreferencesCopyMultiple(keys as CFArray, domain as CFString,
                                                kCFPreferencesCurrentUser, kCFPreferencesAnyHost) as? [String: Any] ?? [:]
         var settings = DamonSettings()
@@ -48,6 +55,7 @@ public struct SettingsStore {
         }
         settings.monitorMusic = values["observeMusic"] as? Bool ?? false
         settings.autoSwitch = values["automatic"] as? Bool ?? false
+        settings.autoReadMusicPanel = values["autoReadMusicPanel"] as? Bool ?? false
         settings.showSampleRate = values["showRate"] as? Bool ?? true
         settings.showBitDepth = values["showDepth"] as? Bool ?? true
         return settings
@@ -73,6 +81,7 @@ public struct SettingsStore {
                 set("approvedFolder", nil)
             case let .monitorMusic(on): set("observeMusic", on)
             case let .autoSwitch(on): set("automatic", on)
+            case let .autoReadMusicPanel(on): set("autoReadMusicPanel", on)
             case let .showSampleRate(on): set("showRate", on)
             case let .showBitDepth(on): set("showDepth", on)
             }

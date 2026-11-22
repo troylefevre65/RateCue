@@ -1,5 +1,6 @@
 @testable import DamonPlatform
 import AppKit
+import CoreAudio
 import DamonPolicy
 import Foundation
 import CoreServices
@@ -34,6 +35,36 @@ struct DamonTests {
         let result = Confidence.resolve(evidence, epoch: epoch, since: 4, now: 6)
         #expect(result.rateConflict)
         #expect(result.format == Format())
+    }
+
+    @Test func sameRateDepthAttributionIgnoresOldAndPrefetchedPlaybackInstances() {
+        let earlier = Epoch(playback: 3, route: 8)
+        let future = Epoch(playback: 5, route: 8)
+        let evidence = [
+            Evidence(epoch: earlier, source: .musicMetadata, at: 10.1, format: Format(rate: 44_100, depth: 16)),
+            Evidence(epoch: epoch, source: .musicMetadata, at: 9.9, format: Format(rate: 44_100, depth: 16)),
+            Evidence(epoch: epoch, source: .musicMetadata, at: 10.2, format: Format(rate: 44_100, depth: 24)),
+            Evidence(epoch: future, source: .musicMetadata, at: 10.3, format: Format(rate: 44_100, depth: 16)),
+            Evidence(epoch: epoch, source: .musicMetadata, at: 11.0, format: Format(rate: 44_100, depth: 16))
+        ]
+        let first = Confidence.resolve(evidence, epoch: epoch, since: 10, now: 10.5)
+        #expect(first.format == Format(rate: 44_100, depth: 24))
+        #expect(!first.depthConflict)
+        #expect(first == Confidence.resolve(evidence.reversed(), epoch: epoch, since: 10, now: 10.5))
+        let nextInstance = Confidence.resolve(evidence, epoch: future, since: 10, now: 10.5)
+        #expect(nextInstance.format == Format(rate: 44_100, depth: 16))
+    }
+
+    @Test func conflictingCurrentDepthDoesNotFallBackOrInvalidateKnownRate() {
+        let evidence = [
+            Evidence(epoch: epoch, source: .sourceStream, at: 5, format: Format(rate: 44_100, depth: 16)),
+            Evidence(epoch: epoch, source: .sourceStream, at: 5.1, format: Format(rate: 44_100, depth: 24)),
+            Evidence(epoch: epoch, source: .musicMetadata, at: 5.2, format: Format(rate: 44_100, depth: 24))
+        ]
+        let result = Confidence.resolve(evidence, epoch: epoch, since: 5, now: 6)
+        #expect(result.format == Format(rate: 44_100))
+        #expect(result.depthConflict)
+        #expect(!result.rateConflict)
     }
 
     private func input(
@@ -166,6 +197,75 @@ struct DamonTests {
         #expect(cleared.attribute(.foregroundColor, at: 0, effectiveRange: nil) == nil)
     }
 
+    @MainActor
+    @Test func menuDisplaysExplicitPanelDepthOnlyAsAnEstimate() {
+        let playback = Playback(state: .playing, trackID: "catalog", position: nil, file: nil, reportedRate: 96_000)
+        let snapshot = PanelFormatSnapshot(format: Format(rate: 96_000, depth: 24), epoch: epoch, trackID: "catalog")
+        let display = FormatDisplay(verified: Format(), playback: playback, panel: snapshot, epoch: epoch)
+        let title = display.statusBarTitle(showRate: true, showDepth: true, warning: false)
+        #expect(title.string == "≈96k / 24")
+        #expect(display.certainty == .panelSnapshot)
+        #expect(title.attribute(.foregroundColor, at: 0, effectiveRange: nil) as? NSColor == .systemOrange)
+        #expect(display.statusBarTitle(showRate: false, showDepth: true, warning: false).string == "≈24")
+        let confirmed = FormatDisplay(verified: Format(rate: 96_000, depth: 16), playback: playback, panel: snapshot, epoch: epoch)
+        #expect(confirmed.certainty == .verified)
+        #expect(confirmed.format == Format(rate: 96_000, depth: 16))
+    }
+
+    @Test func panelSnapshotIsNotReusedForAChangedTrackRouteOrConflictingRate() {
+        let snapshot = PanelFormatSnapshot(format: Format(rate: 96_000, depth: 24), epoch: epoch, trackID: "first")
+        let first = Playback(state: .playing, trackID: "first", position: nil, file: nil, reportedRate: 96_000)
+        let other = Playback(state: .playing, trackID: "other", position: nil, file: nil, reportedRate: 96_000)
+        let conflicting = Playback(state: .playing, trackID: "first", position: nil, file: nil, reportedRate: 44_100)
+        let paused = Playback(state: .paused, trackID: nil, position: nil, file: nil, reportedRate: nil)
+        #expect(snapshot.matchingFormat(playback: first, epoch: epoch) == Format(rate: 96_000, depth: 24))
+        #expect(snapshot.matchingFormat(playback: other, epoch: epoch) == nil)
+        #expect(snapshot.matchingFormat(playback: first, epoch: next) == nil)
+        #expect(snapshot.matchingFormat(playback: conflicting, epoch: epoch) == nil)
+        #expect(snapshot.matchingFormat(playback: paused, epoch: epoch) == nil)
+        let unknown = PanelFormatSnapshot(format: Format(rate: 96_000), epoch: epoch, trackID: "first")
+        #expect(unknown.matchingFormat(playback: first, epoch: epoch) == nil)
+    }
+
+    @MainActor
+    @Test func activeMusicSuppressesTheExperimentalPanelSnapshot() {
+        let playback = Playback(state: .playing, trackID: "catalog", position: nil, file: nil, reportedRate: 44_100)
+        let snapshot = PanelFormatSnapshot(format: Format(rate: 44_100, depth: 16), epoch: epoch, trackID: "catalog")
+        let display = FormatDisplay(verified: Format(), playback: playback, panel: snapshot, epoch: epoch, suppressPanel: true)
+        #expect(display.statusBarTitle(showRate: true, showDepth: true, warning: false).string == "≈44.1k / —")
+        let qualified = FormatDisplay(verified: Format(rate: 44_100, depth: 24), playback: playback, panel: snapshot,
+                                      epoch: epoch, suppressPanel: true)
+        #expect(qualified.certainty == .verified)
+        #expect(qualified.format.depth == 24)
+    }
+
+    @Test func automaticPanelReadingIsOptInAndPersists() throws {
+        let domain = "org.damon.tests.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: domain))
+        defer { defaults.removePersistentDomain(forName: domain) }
+        let store = SettingsStore(domain: domain)
+        #expect(try !store.read().autoReadMusicPanel)
+        try store.apply([.autoReadMusicPanel(true)])
+        #expect(try store.read().autoReadMusicPanel)
+        try store.apply([.autoReadMusicPanel(false)])
+        #expect(try !store.read().autoReadMusicPanel)
+    }
+
+    @Test func monitoringOrPanelSettingChangesInvalidateAutomaticReads() {
+        var previous = DamonSettings()
+        previous.monitorMusic = true
+        previous.autoReadMusicPanel = true
+        var next = previous
+        next.monitorMusic = false
+        #expect(next.invalidatesAutomaticPanelRead(comparedTo: previous))
+        next = previous
+        next.autoReadMusicPanel = false
+        #expect(next.invalidatesAutomaticPanelRead(comparedTo: previous))
+        next = previous
+        next.showBitDepth = false
+        #expect(!next.invalidatesAutomaticPanelRead(comparedTo: previous))
+    }
+
     @Test func constructsNestedReadOnlyMusicPropertySpecifier() throws {
         let track = try MusicObserver.property("pTrk")
         let property = try MusicObserver.property("pSRt", in: track)
@@ -181,10 +281,24 @@ struct DamonTests {
 
     @Test func parsesOnlyExplicitFormatWithoutInferringBitDepth() {
         #expect(MusicFormatPanel.parse("44.1 kHz ALAC") == .init(rate: 44_100, bitDepth: nil))
+        #expect(MusicFormatPanel.parse("24-bit 96 kHz ALAC") == .init(rate: 96_000, bitDepth: 24))
+        #expect(MusicFormatPanel.parse("16-bit 44.1 kHz ALAC") == .init(rate: 44_100, bitDepth: 16))
         #expect(MusicFormatPanel.parse("24-bit / 176,4 kHz ALAC") == .init(rate: 176_400, bitDepth: 24))
+        #expect(MusicFormatPanel.parse("24-bit96 kHz ALAC") == nil)
         #expect(MusicFormatPanel.parse("Lossless up to 192 kHz ALAC") == nil)
         #expect(MusicFormatPanel.parse("256 kHz AAC") == nil)
         #expect(MusicFormatPanel.parse("99-bit / 44.1 kHz ALAC") == nil)
+    }
+
+    @Test func panelObservationRequiresAUniqueBadgeAndFormat() {
+        let reading = MusicFormatPanel.Reading(rate: 96_000, bitDepth: 24)
+        #expect(MusicFormatPanel.classify(badges: 0, panels: []) == .unavailable)
+        #expect(MusicFormatPanel.classify(badges: 2, panels: []) == .unavailable)
+        #expect(MusicFormatPanel.classify(badges: 1, panels: []) == .noOpenPanel)
+        #expect(MusicFormatPanel.classify(badges: 1, panels: [[]]) == .unrecognizedFormat)
+        #expect(MusicFormatPanel.classify(badges: 1, panels: [[reading], [reading]]) == .unrecognizedFormat)
+        #expect(MusicFormatPanel.classify(badges: 1, panels: [[reading, reading]]) == .unrecognizedFormat)
+        #expect(MusicFormatPanel.classify(badges: 1, panels: [[reading]]) == .reading(reading))
     }
 
     @Test func catalogProbeKeepsUnreportedTrackRateSeparateFromThePanel() throws {
@@ -196,6 +310,7 @@ struct DamonTests {
         #expect(result.trackProperty?.rateHz == nil)
         #expect(result.losslessPanel?.rateHz == 44_100)
         #expect(result.losslessPanel?.bitDepth == nil)
+        #expect(result.losslessPanel?.freshness == "notEstablished")
     }
 
     @Test func catalogProbeRejectsEvidenceTakenAcrossATrackChange() {
@@ -206,6 +321,128 @@ struct DamonTests {
                 trackRate: { activeTrack = "second"; return 96_000 },
                 panel: nil, stillPlaying: { true }
             )
+        }
+    }
+
+    @Test func freshPanelProbeRequiresClosedThenOpenForTheSameTrack() throws {
+        var readings: [MusicFormatPanel.Result] = [
+            .noOpenPanel, .noOpenPanel, .reading(.init(rate: 96_000, bitDepth: 24))
+        ]
+        var time = 0.0
+        var ready = false
+        let result = try MusicObserver.probeFreshPanel(
+            trackID: { "track" }, trackRate: { 44_100 }, panel: { readings.removeFirst() },
+            stillPlaying: { true }, now: { time }, sleep: { time += $0 }, onReady: { ready = true }
+        )
+        #expect(ready)
+        #expect(result.trackProperty?.rateHz == 44_100)
+        #expect(result.losslessPanel?.rateHz == 96_000)
+        #expect(result.losslessPanel?.bitDepth == 24)
+        #expect(result.losslessPanel?.freshness == "openedDuringProbe")
+    }
+
+    @Test func freshPanelJSONOmitsUnreportedBitDepth() throws {
+        var readings: [MusicFormatPanel.Result] = [.noOpenPanel, .reading(.init(rate: 44_100, bitDepth: nil))]
+        let result = try MusicObserver.probeFreshPanel(
+            trackID: { "track" }, trackRate: { 44_100 }, panel: { readings.removeFirst() },
+            stillPlaying: { true }, now: { 0 }, sleep: { _ in }, onReady: {}
+        )
+        let json = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(result)) as? [String: Any])
+        let panel = try #require(json["losslessPanel"] as? [String: Any])
+        #expect(panel["rateHz"] as? Int == 44_100)
+        #expect(panel["bitDepth"] == nil)
+        #expect(panel["freshness"] as? String == "openedDuringProbe")
+    }
+
+    @Test func freshPanelProbeRejectsAnExistingOrUnobservablePanel() {
+        for (initial, expected) in [
+            (MusicFormatPanel.Result.reading(.init(rate: 96_000, bitDepth: 24)), MusicObserver.FreshPanelError.alreadyOpen),
+            (.unrecognizedFormat, .alreadyOpen), (.unavailable, .unavailable), (.accessibilityDenied, .accessibilityDenied)
+        ] {
+            var ready = false
+            do {
+                _ = try MusicObserver.probeFreshPanel(
+                    trackID: { "track" }, trackRate: { 96_000 }, panel: { initial },
+                    stillPlaying: { true }, now: { 0 }, sleep: { _ in }, onReady: { ready = true }
+                )
+                Issue.record("The probe accepted an existing or unobservable panel.")
+            } catch {
+                #expect(error as? MusicObserver.FreshPanelError == expected)
+            }
+            #expect(!ready)
+        }
+    }
+
+    @Test func panelPermissionErrorNamesTheCurrentAndEarlierSettingsLocations() {
+        let guidance = MusicObserver.FreshPanelError.accessibilityDenied.errorDescription
+        #expect(guidance?.contains("Device Control and Data Access") == true)
+        #expect(guidance?.contains("Accessibility") == true)
+    }
+
+    @Test func freshPanelProbeRejectsATrackChangeDuringThePanelRead() {
+        var track = "before"
+        var reads = 0
+        #expect(throws: MusicObservationError.self) {
+            _ = try MusicObserver.probeFreshPanel(
+                trackID: { track }, trackRate: { 96_000 }, panel: {
+                    reads += 1
+                    if reads == 1 { return .noOpenPanel }
+                    track = "after"
+                    return .reading(.init(rate: 96_000, bitDepth: 24))
+                }, stillPlaying: { true }, now: { 0 }, sleep: { _ in }, onReady: {}
+            )
+        }
+    }
+
+    @Test func freshPanelProbeRejectsAnUnexpectedTrackBeforeReadingThePanel() {
+        var panelRead = false
+        #expect(throws: MusicObservationError.self) {
+            _ = try MusicObserver.probeFreshPanel(
+                trackID: { "new" }, trackRate: { 96_000 }, panel: { panelRead = true; return .noOpenPanel },
+                stillPlaying: { true }, now: { 0 }, sleep: { _ in }, onReady: {}, expectedTrackID: "old"
+            )
+        }
+        #expect(!panelRead)
+    }
+
+    @Test func openPanelReadingRequiresTheSamePlayingTrackBeforeAndAfter() throws {
+        let expected = MusicFormatPanel.Result.reading(.init(rate: 44_100, bitDepth: 24))
+        let result = try MusicObserver.readOpenPanel(
+            expectedTrackID: "track", trackID: { "track" }, stillPlaying: { true }, panel: { expected }
+        )
+        #expect(result == expected)
+        var current = "track"
+        #expect(throws: MusicObservationError.self) {
+            _ = try MusicObserver.readOpenPanel(
+                expectedTrackID: "track", trackID: { current }, stillPlaying: { true },
+                panel: { current = "other"; return expected }
+            )
+        }
+    }
+
+    @Test func freshPanelProbeRejectsAnAmbiguousPanelAfterOpening() {
+        var readings: [MusicFormatPanel.Result] = [.noOpenPanel, .unrecognizedFormat]
+        do {
+            _ = try MusicObserver.probeFreshPanel(
+                trackID: { "track" }, trackRate: { 96_000 }, panel: { readings.removeFirst() },
+                stillPlaying: { true }, now: { 0 }, sleep: { _ in }, onReady: {}
+            )
+            Issue.record("The probe accepted an ambiguous opened panel.")
+        } catch {
+            #expect(error as? MusicObserver.FreshPanelError == .unrecognizedFormat)
+        }
+    }
+
+    @Test func freshPanelProbeTimesOutWithoutGuessingDepth() {
+        var time = 0.0
+        do {
+            _ = try MusicObserver.probeFreshPanel(
+                trackID: { "track" }, trackRate: { 96_000 }, panel: { .noOpenPanel },
+                stillPlaying: { true }, now: { time }, sleep: { time += $0 }, onReady: {}, timeout: 0.4
+            )
+            Issue.record("The probe succeeded without an opened panel.")
+        } catch {
+            #expect(error as? MusicObserver.FreshPanelError == .timedOut)
         }
     }
 

@@ -3,11 +3,13 @@ import Foundation
 
 public enum DamonCLI {
     private static let usage = """
+    RateCue CLI (Damon executable)
     Usage: Damon <command>
 
+      --version                                    Show the application version and build.
       devices                                      List Core Audio outputs as JSON.
-      config show                                  Read Damon's saved preferences as JSON.
-      config set [options]                         Update Damon's saved preferences.
+      config show                                  Read RateCue preferences as JSON.
+      config set [options]                         Update RateCue preferences.
         --device <uid|exact-name|none>
         --local-audio <file-or-folder> | --clear-local-audio
         --monitor-music <on|off>
@@ -16,7 +18,7 @@ public enum DamonCLI {
         --show-depth <on|off>
       authorize-music                              Request Music Automation access explicitly.
       status                                       Read a fresh Music and device snapshot as JSON.
-      probe-format [--panel]                       Read unqualified Music format evidence without switching.
+      probe-format [--panel|--fresh-panel]         Read unqualified Music format evidence without switching.
       playback <play|pause|next>                   Send one playback command to the running Music app.
       check --rate <Hz> --depth <bits> [options]    Check the current source format and Music output.
         --device <uid|exact-name>                  Defaults to the saved preferred device.
@@ -32,8 +34,12 @@ public enum DamonCLI {
       --compare-pcm <reference> <candidate> [--offset-frames <N>]
       --diagnose                                   Print a human-readable output-device list.
 
-    Run Damon without arguments to open the menu app. Status and check do not start Music,
-    play tracks, request permissions, or change audio settings. Check exit codes:
+    Run the executable without arguments to open RateCue. Status and check do not start Music,
+    play tracks, request permissions, or change audio settings; they do not include amber panel
+    estimates. Use probe-format for unqualified Music evidence. Playback and fixture trials
+    can change playback; test-switch can change the selected device's rate.
+    Device lists and configuration output can contain device identifiers or local paths.
+    Check exit codes:
     0 = all assertions matched, 1 = mismatch or unavailable evidence, 2 = invalid invocation.
     """
 
@@ -104,6 +110,9 @@ public enum DamonCLI {
             case "help", "--help", "-h":
                 try requireArgumentCount(args, 1)
                 print(usage)
+            case "version", "--version":
+                try requireArgumentCount(args, 1)
+                print(try AppInformation().versionDescription)
             case "devices":
                 try requireArgumentCount(args, 1)
                 try printJSON(connectedDevices().map(DeviceInfo.init))
@@ -132,13 +141,23 @@ public enum DamonCLI {
                 let settings = try store.read()
                 try printJSON(Observation(sample: observe(settings), settings: settings))
             case "probe-format":
-                let options = try parseOptions(Array(args.dropFirst()), allowed: [], flags: ["--panel"])
+                let options = try parseOptions(Array(args.dropFirst()), allowed: [], flags: ["--panel", "--fresh-panel"])
+                guard options["--panel"] == nil || options["--fresh-panel"] == nil else {
+                    throw CommandError("Use either --panel or --fresh-panel, not both.")
+                }
                 guard let pid = musicPID else { throw CommandError("Open Music before probing the format.", exitCode: 1) }
                 let permission = MusicObserver.requestPermission(pid: pid, askIfNeeded: false)
                 guard permission == 0 else {
                     throw CommandError("Music Automation unavailable (\(permission)). Run authorize-music explicitly.", exitCode: 1)
                 }
-                try printJSON(MusicObserver.probeFormat(pid: pid, readPanel: options["--panel"] != nil))
+                if options["--fresh-panel"] != nil {
+                    let result = try MusicObserver.probeFreshPanel(pid: pid) {
+                        FileHandle.standardError.write(Data("Open Music's Lossless panel now; waiting up to 15 seconds.\n".utf8))
+                    }
+                    try printJSON(result)
+                } else {
+                    try printJSON(MusicObserver.probeFormat(pid: pid, readPanel: options["--panel"] != nil))
+                }
             case "playback":
                 try requireArgumentCount(args, 2)
                 guard let action = MusicObserver.TransportAction(rawValue: args[1]) else {
@@ -173,7 +192,7 @@ public enum DamonCLI {
             }
             return 0
         } catch {
-            FileHandle.standardError.write(Data("Damon: \(error.localizedDescription)\n".utf8))
+            FileHandle.standardError.write(Data("RateCue: \(error.localizedDescription)\n".utf8))
             return (error as? CommandError)?.exitCode ?? 1
         }
     }

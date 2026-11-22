@@ -1,14 +1,16 @@
-# Damon (BitStream Manager)
+# RateCue
 
 **Automatic playback format alignment for Apple Music on macOS**
 
 This clean-room specification defines observable behavior and acceptance criteria. It does not prescribe frameworks, internal modules, or how evidence is collected. See the [development and test plan](./PLAN.md) for implementation guidance and qualification procedures.
 
+These are product requirements and release gates, not a claim that the development preview already satisfies them. Current capabilities and unqualified behavior are recorded in the [README](./README.md) and [test plan](./PLAN.md#development-build-and-qualification-status).
+
 ## 1. Scope
 
-Damon is a lightweight macOS menu bar app. It monitors Apple Music playback and the selected output device, aligns the device's sample rate when it can establish the active rendition's rate, and shows what evidence supports the result. Apple Music is required; Apple Silicon is preferred. Qualify USB and Thunderbolt output configurations separately.
+RateCue is a lightweight macOS menu bar app. It monitors Apple Music playback and the selected output device, aligns the device's sample rate when it can establish the active rendition's rate, and shows what evidence supports the result. Apple Music is required; Apple Silicon is preferred. Qualify USB and Thunderbolt output configurations separately.
 
-Sample-rate alignment is not proof of bit-perfect playback. The app distinguishes the source format, the configured output rate, the hardware link rate, and digital sample integrity. Automatic alignment is supported only on configurations where documented interfaces establish both the active rendition's rate and Music's actual output route. Otherwise, Damon is monitor-only.
+Sample-rate alignment is not proof of bit-perfect playback. The app distinguishes the source format, the configured output rate, the hardware link rate, and digital sample integrity. Automatic alignment is supported only on configurations where documented interfaces establish both the active rendition's rate and Music's actual output route. Otherwise, RateCue is monitor-only.
 
 Non-goals: library management, replacing playback controls, DSP, equalization, upsampling, audio enhancement, and support for other streaming services.
 
@@ -16,15 +18,17 @@ Non-goals: library management, replacing playback controls, DSP, equalization, u
 
 - Display `44.1k / 16` by default when both source fields are known. The sample-rate and bit-depth toggles work independently (`44.1k` or `16`). Show `—` for an unknown field. If both fields are hidden, retain the icon and status.
 - Show a qualified source format in green. When only a Music-reported sample rate is available, show it in amber with `≈` (for example, `≈44.1k / —`) and identify it as unverified in text. Do not guess bit depth or use the estimate for alignment. Green describes source-format evidence, not DAC verification or bit-perfect playback.
+- On an explicit user request, an observed freshly opened Music Lossless panel—or an open panel the user confirms was just opened—may supply a bit-depth snapshot in amber. An experimental, separately enabled option may open and close a previously closed panel automatically when Music is not active. Warn that panel contents may be stale. The snapshot is unverified, never used for alignment, and cleared when playback or the output route changes. A panel that omits depth leaves depth unknown.
 - The menu distinguishes **Track Format**, **Preferred Device**, and **Active Output**. Output format is never substituted for unknown source format.
 - Show **Auto Switch Sample Rate**, **Select Output Device**, **Verification Status**, **Logs**, **Launch at Login**, **Check for Updates**, and **Quit**.
+- Provide About, Help, and Credits from the menu. About shows the app's bundled version and build and the project credits. Help explains setup, format confidence, and how to build and test.
 - Warn when the preferred device is unavailable, the route or rate is unsupported, alignment fails, or the device drifts after alignment. Report unknown or ambiguous source evidence as **Unknown Format**. Distinguish these states from disabled auto-switching and from the verification outcomes below.
 
 ## 3. Playback, device selection, and alignment
 
 1. Monitor Music starts, pauses, stops, resumes, next/previous, queue progression, and repeat. Reevaluate when the rendition or output route changes, including when the track ID stays the same. Monitor device presence and configuration even when Music is not playing.
 2. Persist the selected device's documented stable identifier. Do not use its name or a transient runtime identifier as its identity. After login, reboot, sleep/wake, DAC power cycling, or re-enumeration, resume management when the same device is available and confirmed as Music's output. A different identifier requires reselection. Never fall back to another device or change the system output route.
-3. Change the sample rate only if Auto Switch is enabled, Music is confirmed to be actively playing through the preferred device, and a qualified source rate differs from the current setting. The exact rate must be supported and writable. Do not write for a matching setting, unsupported rate, ambiguous target, or paused, stopped, or unconfirmed playback. An unknown bit depth does not block a qualified rate change. Damon does not force the device's bit depth.
+3. Change the sample rate only if Auto Switch is enabled, Music is confirmed to be actively playing through the preferred device, and a qualified source rate differs from the current setting. The exact rate must be supported and writable. Do not write for a matching setting, unsupported rate, ambiguous target, or paused, stopped, or unconfirmed playback. An unknown bit depth does not block a qualified rate change. RateCue does not force the device's bit depth.
 4. Confirm a change by reading the configured rate back from the same device. A successful write response alone is not confirmation. Retry a transient alignment failure at most once and within the adjustment deadline; recheck the rate, playback state, and route before retrying. If verification sensors fail, retain the current configuration. If another actor changes the device rate after alignment, report the drift instead of repeatedly overriding it.
 5. A new playback instance, route or device change, or an applicable preference change invalidates pending results. Never publish an obsolete write's result as current. If the write is already in flight, let it settle and reread the device before acting on the latest eligible state.
 
@@ -63,6 +67,8 @@ Bit-perfect verification requires an independent digital comparison at the targe
 ## 5. Privacy and clean-room boundaries
 
 Use documented interfaces and explicitly exposed, permissioned observations only. No private notifications, undocumented log parsing, proprietary component reverse engineering, or inspection of protected streams. Operating system logs may support troubleshooting but are not authoritative format evidence.
+
+Automatic interaction with Music's Lossless panel is disabled by default and requires explicit opt-in, Music monitoring, and Accessibility access. Cancel an in-flight automatic read when monitoring or automatic panel reading is switched off. Do not interact with a panel that was already open or when Music is active. Clear the panel snapshot when Music becomes active; attempt a new read after Music becomes inactive. Report failed or interrupted checks without presenting a depth.
 
 Webcam LED and microphone relay verification are independently opt-in. Request permission only when the corresponding feature is enabled. Analyze signals locally without retaining raw video or audio. Denial or revocation disables the affected verifier, not core monitoring.
 

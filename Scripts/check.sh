@@ -1,16 +1,22 @@
 #!/bin/sh
+# Usage: sh Scripts/check.sh
+# Validate, test, and rebuild dist/RateCue.app. Version and build come from Packaging/Info.plist.
 set -eu
 
 cd "$(dirname "$0")/.."
 if [ "$(uname -s)" != Darwin ]; then
-    printf '%s\n' 'Damon checks require macOS.' >&2
+    printf '%s\n' 'RateCue checks require macOS.' >&2
     exit 1
 fi
 
 plutil -lint Packaging/Info.plist Packaging/Damon.entitlements
 swift test
 sh Packaging/build-app.sh
-bundle=dist/Damon.app/Contents
+bundle=dist/RateCue.app/Contents
 "$bundle/MacOS/Damon" --help > /dev/null
+name=$(plutil -extract CFBundleName raw -o - "$bundle/Info.plist")
+version=$(plutil -extract CFBundleShortVersionString raw -o - "$bundle/Info.plist")
+build=$(plutil -extract CFBundleVersion raw -o - "$bundle/Info.plist")
+test "$("$bundle/MacOS/Damon" --version)" = "$name $version (build $build)"
 cmp LICENSE "$bundle/Resources/LICENSE"
 cmp NOTICE "$bundle/Resources/NOTICE"

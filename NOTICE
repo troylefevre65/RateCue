@@ -1,13 +1,13 @@
-Damon (BitStream Manager)
+RateCue (formerly Damon / BitStream Manager)
 
-Damon is licensed under the GNU General Public License, version 3 only
+RateCue is licensed under the GNU General Public License, version 3 only
 (GPL-3.0-only). See LICENSE for the complete license text.
 
 Related work and attribution
 
 LosslessSwitcher 3.0-beta1, by Vincent Neo and the LosslessSwitcher
 contributors, established the precedent for automatic Apple Music sample-rate
-switching on macOS that inspired Damon.
+switching on macOS that inspired RateCue.
 
 Project:      https://github.com/vincentneo/LosslessSwitcher
 Release:      https://github.com/vincentneo/LosslessSwitcher/releases/tag/3.0-beta1
@@ -15,7 +15,7 @@ Revision:     4d10fda7af7686669234cc5f89241482bba30767
 License:      https://github.com/vincentneo/LosslessSwitcher/blob/3.0-beta1/LICENSE
 Contributors: https://github.com/vincentneo/LosslessSwitcher/graphs/contributors
 
-Damon is a separate clean-room project, not a fork or an official
+RateCue is a separate clean-room project, not a fork or an official
 LosslessSwitcher release. This repository does not include LosslessSwitcher
-source, binaries, or artwork. The upstream credit does not attribute Damon's
+source, binaries, or artwork. The upstream credit does not attribute RateCue's
 implementation to Vincent Neo or the LosslessSwitcher contributors.
