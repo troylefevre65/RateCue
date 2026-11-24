@@ -272,12 +272,13 @@ public struct BitDepthCorrelationEngine: Sendable {
         }
         let strongestByFamily = Dictionary(grouping: flattenedSources, by: { $0.1.independenceFamily })
             .compactMapValues {
-                $0.max { lhs, rhs in
-                    if lhs.2.rawValue == rhs.2.rawValue {
-                        return lhs.1.rawValue > rhs.1.rawValue
-                    }
-                    return lhs.2.rawValue < rhs.2.rawValue
+                group -> (DepthCandidate, DepthEvidenceSource, DepthEvidenceStrength)? in
+                guard let strongest = group.max(by: { $0.2.rawValue < $1.2.rawValue })?.2 else {
+                    return nil
                 }
+                let contenders = group.filter { $0.2 == strongest }
+                guard Set(contenders.map(\.0)).count == 1 else { return nil }
+                return contenders.min { $0.1.rawValue < $1.1.rawValue }
             }
         for candidate in DepthCandidate.allCases {
             let candidateSources = (sources[candidate] ?? [:]).sorted(by: { $0.key.rawValue < $1.key.rawValue })

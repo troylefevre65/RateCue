@@ -486,56 +486,22 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let preferred = previousDevice
         let display = formatDisplay()
         menu.removeAllItems()
-        append("RateCue")
-        append("Preferred Device: " + (preferred?.name ?? (preferredUID == nil ? "Not selected" : "Unavailable")))
-        let active = sample?.activeOutputs ?? []
-        append("Active Output: " + (active.isEmpty ? "Unconfirmed" : active.map(\.name).joined(separator: ", ")))
+
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+        append(version.map { "RateCue \($0)" } ?? "RateCue")
         let trackRate = display.format.rate.map {
             ([.estimated, .panelSnapshot, .correlated].contains(display.certainty) ? "≈" : "") + "\($0) Hz"
         } ?? "—"
         let trackDepth = display.format.depth.map { "\($0)-bit" } ?? "—"
         append("Track Format: \(trackRate) / \(trackDepth)")
-        append("Confidence: \(display.certainty.rawValue)")
-        if let resolution = depthResolution(for: sample) {
-            let candidate = resolution.candidate.map { "\($0.rawValue)-bit" } ?? "unknown"
-            let provenance = resolution.provenance.map(\.rawValue).joined(separator: ", ")
-            let sources = provenance.isEmpty ? "no contributing observations" : provenance
-            let prior = resolution.usedHighRatePrior ? "; high-rate prior" : ""
-            append("Bit-depth: 16-bit \(resolution.posterior16)% / 24-bit \(resolution.posterior24)%")
-            append(
-                "Correlation: \(resolution.evidenceAvailable ? "evidence" : "prior only")"
-                    + " (\(candidate); \(sources)\(prior))"
-            )
-            append("Depth prior: 16-bit \(resolution.prior16)% / 24-bit \(resolution.prior24)%")
-            for contribution in resolution.contributions {
-                let candidate = contribution.candidate.map { "\($0.rawValue)-bit" } ?? "unknown"
-                let ratio = contribution.likelihoodRatio.map { String(format: "%.2fx", $0) } ?? "—"
-                let odds = String(format: "%+.3f", contribution.logOddsContribution)
-                append(
-                    "Influence: \(contribution.source) → \(candidate), "
-                        + "\(contribution.strength), LR \(ratio), log-odds \(odds)"
-                )
-            }
-        } else {
-            append("Bit-depth: 50% / 50% (no current playback context)")
-        }
-        if settings.autoReadMusicPanel, let automaticPanelStatus {
-            append("Automatic depth: \(automaticPanelStatus)")
-        }
-        append("Preferred Device Rate: " + (preferred?.nominalRate.map { "\($0) Hz" } ?? "—"))
+        append("Evidence status: \(display.certainty.rawValue)")
         append("Status: \(status(sample: sample))")
-        if let sample, sample.message != status(sample: sample) { append("Music: \(sample.message)") }
+        append("Preferred Device: " + (preferred?.name ?? (preferredUID == nil ? "Not selected" : "Unavailable")))
+        let active = sample?.activeOutputs ?? []
+        append("Active Output: " + (active.isEmpty ? "Unconfirmed" : active.map(\.name).joined(separator: ", ")))
         menu.addItem(.separator())
-        append("Show Sample Rate", action: #selector(toggleRate)).state = showRate ? .on : .off
-        append("Show Bit Depth", action: #selector(toggleDepth)).state = showDepth ? .on : .off
-        append("Automatically Read Music Panel (Experimental)", action: #selector(toggleAutomaticPanelRead)).state =
-            settings.autoReadMusicPanel ? .on : .off
-        append("Auto Switch Sample Rate", action: #selector(toggleAutomatic)).state = automatic ? .on : .off
-        append("Monitor Apple Music", action: #selector(toggleAutomation)).state = automation ? .on : .off
-        append("Choose Authorized Local Audio…", action: #selector(chooseLocalAudio))
-        if approvedFolder != nil { append("Stop Inspecting Local Audio Files", action: #selector(removeFolder)) }
-        menu.addItem(.separator())
-        let devices = NSMenu()
+
+        let devices = NSMenu(title: "Select Output Device")
         for device in sample?.outputs ?? [] {
             let entry = NSMenuItem(title: device.name, action: #selector(selectDevice(_:)), keyEquivalent: "")
             entry.target = self
@@ -544,47 +510,137 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             entry.toolTip = device.uid
             devices.addItem(entry)
         }
-        if devices.items.isEmpty { devices.addItem(NSMenuItem(title: "No output devices", action: nil, keyEquivalent: "")) }
+        if devices.items.isEmpty {
+            devices.addItem(NSMenuItem(title: "No output devices", action: nil, keyEquivalent: ""))
+        }
         append("Select Output Device").submenu = devices
-        let verification = NSMenu()
-        verification.addItem(NSMenuItem(title: profile == nil ? "No calibrated profile for the preferred device" : verifier.description,
-                                       action: nil, keyEquivalent: ""))
-        let camera = NSMenuItem(title: "Verify DAC LEDs with Camera", action: profile?.camera?.isValid == true ? #selector(toggleCamera) : nil,
-                                keyEquivalent: "")
-        camera.target = self
-        camera.state = defaults.bool(forKey: "cameraVerification") ? .on : .off
-        verification.addItem(camera)
-        let relay = NSMenuItem(title: "Confirm DAC Relay with Microphone",
-                               action: profile?.microphone?.isValid == true ? #selector(toggleRelay) : nil, keyEquivalent: "")
-        relay.target = self
-        relay.state = defaults.bool(forKey: "relayVerification") ? .on : .off
-        verification.addItem(relay)
-        verification.addItem(NSMenuItem(title: "Digital sample integrity not established", action: nil, keyEquivalent: ""))
-        append("Verification Status").submenu = verification
-        append("Logs…", action: #selector(showLogs))
-        append("Copy Diagnostics", action: #selector(copyDiagnostics))
-        append("Qualification Snapshot…", action: #selector(showQualificationSnapshot))
-        let panelAvailable = panelTask == nil && automaticPanelTask == nil
-        append("Read Open Music Lossless Panel…", action: panelAvailable ? #selector(readMusicFormatPanel) : nil)
-        append(panelAvailable ? "Read Fresh Music Lossless Panel…" : "Reading Music Lossless Panel…",
-               action: panelAvailable ? #selector(readFreshMusicFormatPanel) : nil)
-        append("Accessibility Access…", action: #selector(showAccessibilityAccess))
+        append("Monitor Apple Music", action: #selector(toggleAutomation)).state = automation ? .on : .off
+        let canAutoSwitch = !qualifiedConfigurations.isEmpty
+        if canAutoSwitch {
+            append("Auto Switch Sample Rate", action: #selector(toggleAutomatic)).state =
+                automatic ? .on : .off
+        }
+
+        let displayOptions = NSMenu(title: "Display Options")
+        append("Show Sample Rate", action: #selector(toggleRate), to: displayOptions).state = showRate ? .on : .off
+        append("Show Bit Depth", action: #selector(toggleDepth), to: displayOptions).state = showDepth ? .on : .off
+        append("Display Options").submenu = displayOptions
         menu.addItem(.separator())
+
+        let musicEvidence = NSMenu(title: "Music Evidence")
+        append(
+            "Automatically Read Music Panel (Experimental)",
+            action: #selector(toggleAutomaticPanelRead), to: musicEvidence
+        ).state = settings.autoReadMusicPanel ? .on : .off
+        let panelAvailable = panelTask == nil && automaticPanelTask == nil
+        append(
+            "Read Open Music Lossless Panel…",
+            action: panelAvailable ? #selector(readMusicFormatPanel) : nil, to: musicEvidence
+        )
+        append(
+            panelAvailable ? "Read Fresh Music Lossless Panel…" : "Reading Music Lossless Panel…",
+            action: panelAvailable ? #selector(readFreshMusicFormatPanel) : nil, to: musicEvidence
+        )
+        musicEvidence.addItem(.separator())
+        append("Accessibility Access…", action: #selector(showAccessibilityAccess), to: musicEvidence)
+        append("Music Evidence").submenu = musicEvidence
+
+        let verification = NSMenu(title: "Verification")
+        verification.addItem(NSMenuItem(
+            title: profile == nil ? "No calibrated profile for the preferred device" : verifier.description,
+            action: nil, keyEquivalent: ""
+        ))
+        if let profile {
+            if profile.camera?.isValid == true {
+                let camera = NSMenuItem(
+                    title: "Verify DAC LEDs with Camera", action: #selector(toggleCamera), keyEquivalent: ""
+                )
+                camera.target = self
+                camera.state = defaults.bool(forKey: "cameraVerification") ? .on : .off
+                verification.addItem(camera)
+            }
+            if profile.microphone?.isValid == true {
+                let relay = NSMenuItem(
+                    title: "Confirm DAC Relay with Microphone", action: #selector(toggleRelay), keyEquivalent: ""
+                )
+                relay.target = self
+                relay.state = defaults.bool(forKey: "relayVerification") ? .on : .off
+                verification.addItem(relay)
+            }
+        }
+        verification.addItem(NSMenuItem(
+            title: "Digital sample integrity not established", action: nil, keyEquivalent: ""
+        ))
+        append("Verification").submenu = verification
+
+        let diagnostics = NSMenu(title: "Advanced Diagnostics")
+        if let resolution = depthResolution(for: sample) {
+            let candidate = resolution.candidate.map { "\($0.rawValue)-bit" } ?? "unknown"
+            let provenance = resolution.provenance.map(\.rawValue).joined(separator: ", ")
+            let sources = provenance.isEmpty ? "no contributing observations" : provenance
+            let prior = resolution.usedHighRatePrior ? "; high-rate prior" : ""
+            append(
+                "Bit-depth: 16-bit \(resolution.posterior16)% / 24-bit \(resolution.posterior24)%",
+                to: diagnostics
+            )
+            append(
+                "Correlation: \(resolution.evidenceAvailable ? "evidence" : "prior only")"
+                    + " (\(candidate); \(sources)\(prior))",
+                to: diagnostics
+            )
+            append(
+                "Depth prior: 16-bit \(resolution.prior16)% / 24-bit \(resolution.prior24)%",
+                to: diagnostics
+            )
+            for contribution in resolution.contributions {
+                let candidate = contribution.candidate.map { "\($0.rawValue)-bit" } ?? "unknown"
+                let ratio = contribution.likelihoodRatio.map { String(format: "%.2fx", $0) } ?? "—"
+                let odds = String(format: "%+.3f", contribution.logOddsContribution)
+                append(
+                    "Influence: \(contribution.source) → \(candidate), "
+                        + "\(contribution.strength), LR \(ratio), log-odds \(odds)",
+                    to: diagnostics
+                )
+            }
+        } else {
+            append("Bit-depth: 50% / 50% (no current playback context)", to: diagnostics)
+        }
+        if settings.autoReadMusicPanel, let automaticPanelStatus {
+            append("Automatic depth: \(automaticPanelStatus)", to: diagnostics)
+        }
+        append("Preferred Device Rate: " + (preferred?.nominalRate.map { "\($0) Hz" } ?? "—"), to: diagnostics)
+        if let sample, sample.message != status(sample: sample) {
+            append("Music: \(sample.message)", to: diagnostics)
+        }
+        diagnostics.addItem(.separator())
+        append("Logs…", action: #selector(showLogs), to: diagnostics)
+        append("Copy Diagnostics", action: #selector(copyDiagnostics), to: diagnostics)
+        append("Qualification Snapshot…", action: #selector(showQualificationSnapshot), to: diagnostics)
+        diagnostics.addItem(.separator())
+        append("Choose Authorized Local Audio…", action: #selector(chooseLocalAudio), to: diagnostics)
+        if approvedFolder != nil {
+            append("Stop Inspecting Local Audio Files", action: #selector(removeFolder), to: diagnostics)
+        }
+        append("Advanced Diagnostics").submenu = diagnostics
+        menu.addItem(.separator())
+
         append("About RateCue…", action: #selector(showAbout))
         append("Help…", action: #selector(showHelp))
         append("Credits…", action: #selector(showCredits))
         menu.addItem(.separator())
         let login = SMAppService.mainApp.status
-        append("Launch at Login", action: #selector(toggleLogin)).state = login == .enabled ? .on : login == .requiresApproval ? .mixed : .off
-        append("Check for Updates…", action: #selector(checkForUpdates))
+        append("Launch at Login", action: #selector(toggleLogin)).state =
+            login == .enabled ? .on : login == .requiresApproval ? .mixed : .off
         append("Quit RateCue", action: #selector(quit), key: "q")
     }
 
     @discardableResult
-    private func append(_ title: String, action: Selector? = nil, key: String = "") -> NSMenuItem {
+    private func append(
+        _ title: String, action: Selector? = nil, key: String = "", to targetMenu: NSMenu? = nil
+    ) -> NSMenuItem {
         let row = NSMenuItem(title: title, action: action, keyEquivalent: key)
         row.target = self
-        menu.addItem(row)
+        (targetMenu ?? menu).addItem(row)
         return row
     }
 
@@ -707,7 +763,15 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let mostLikely = resolution.posterior16 == resolution.posterior24
             ? "tied"
             : resolution.posterior16 > resolution.posterior24 ? "16-bit" : "24-bit"
-        let candidate = resolution.candidate.map { "\($0.rawValue)-bit" } ?? "withheld at 90% threshold"
+        let candidate = if let candidate = resolution.candidate {
+            "\(candidate.rawValue)-bit"
+        } else if resolution.conflict {
+            "withheld (conflict)"
+        } else if !resolution.evidenceAvailable {
+            "withheld (prior only)"
+        } else {
+            "withheld (below 90%)"
+        }
         return "16-bit \(resolution.posterior16)% / 24-bit \(resolution.posterior24)%; "
             + "model \(resolution.modelVersion); most likely \(mostLikely); candidate \(candidate); "
             + "conflict \(resolution.conflict); evidence available \(resolution.evidenceAvailable); "
@@ -718,7 +782,7 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let display = formatDisplay()
         let text = """
             Track format: \(display.statusBarTitle(showRate: true, showDepth: true, warning: false).string)
-            Confidence: \(display.certainty.rawValue)
+            Evidence status: \(display.certainty.rawValue)
             Bit-depth posterior: \(depthDiagnosticText())
             Music monitoring: \(automation ? "on" : "off")
             Accessibility access: \(MusicFormatPanel.hasAccessibilityAccess ? "enabled" : "not enabled")
@@ -1029,10 +1093,6 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    @objc private func checkForUpdates() {
-        alert("Local development build", detail: "No update service is configured. Rebuild RateCue from this workspace for updates.")
-    }
-
     @objc private func showAbout() {
         do {
             let info = try AppInformation()
@@ -1062,10 +1122,10 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             Green indicates a qualified local source format. Amber with ≈ is an unverified Music-reported rate or panel snapshot; — means unknown. Status can still say Unknown Format when an amber estimate is displayed. A matching rate alone does not prove bit-perfect playback.
 
             Music panel and permissions
-            Use Accessibility Access to check or request permission. Open Music's Lossless panel and choose Read Open Music Lossless Panel to display a user-confirmed amber snapshot. Automatically Read Music Panel is opt-in and experimental: after playback, route, or reported-rate changes it briefly opens and closes the panel, even while Music is active. Those changes invalidate the old snapshot. Use Copy Diagnostics to copy a status summary.
+            Use Music Evidence → Accessibility Access to check or request permission. Open Music's Lossless panel and choose Music Evidence → Read Open Music Lossless Panel to display a user-confirmed amber snapshot. Automatically Read Music Panel is opt-in and experimental: after playback, route, or reported-rate changes it briefly opens and closes the panel, even while Music is active. Those changes invalidate the old snapshot. Use Advanced Diagnostics → Copy Diagnostics to copy a status summary.
 
             Local files and verification
-            Use Choose Authorized Local Audio to inspect a file or a dedicated fixture folder. Catalog source depth and automatic catalog switching remain unqualified. Camera and microphone verification requires a calibrated device profile and separate permission. Check for Updates is a placeholder in this build.
+            Advanced Diagnostics contains logs, copied diagnostics, qualification snapshots, and authorized local-audio tools. Catalog source depth and automatic catalog switching remain unqualified. Verification controls appear only for a calibrated device profile and still require separate permission.
 
             Build and test
             On macOS 15 or later with Xcode 16 and Swift 6, run sh Scripts/check.sh from the project folder. Use the bundled executable with --help for CLI commands.

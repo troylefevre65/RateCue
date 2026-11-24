@@ -115,7 +115,7 @@ struct DamonTests {
         #expect(result.candidate == nil)
         #expect(result.usedHighRatePrior)
         #expect(result.conflict)
-        #expect(result.contributions.filter { $0.logOddsContribution != 0 && $0.source != "ratePrior" }.map(\.source) == ["musicLog"])
+        #expect(result.contributions.filter { $0.logOddsContribution != 0 && $0.source != "ratePrior" }.isEmpty)
     }
 
     @Test func highRatePriorNeverOverturnsA16BitEvidenceLead() {

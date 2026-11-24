@@ -8,12 +8,27 @@ set -eu
 cd "$(dirname "$0")/.."
 swift build --configuration release
 bin="$(swift build --configuration release --show-bin-path)/RateCue"
-app=dist/RateCue.app
+mkdir -p dist
+final_app=dist/RateCue.app
+stage="$(mktemp -d "dist/.RateCue-build.XXXXXX")"
+app="$stage/RateCue.app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp Packaging/Info.plist "$app/Contents/Info.plist"
 cp LICENSE NOTICE "$app/Contents/Resources/"
+iconwork="$(mktemp -d "${TMPDIR:-/tmp}/RateCue-icon.XXXXXX")"
+iconset="$iconwork/RateCue.iconset"
+mkdir "$iconset"
 staged="$(mktemp "$app/Contents/MacOS/.RateCue.XXXXXX")"
-trap 'rm -f "$staged"' EXIT
+trap 'rm -f "$staged"; rm -rf "$iconwork" "$stage"' EXIT
+for size in 16 32 128 256 512; do
+    /usr/bin/sips -z "$size" "$size" Branding/RateCue-Icon-1024.png --out "$iconset/icon_${size}x${size}.png" >/dev/null
+done
+for size in 16 32 128 256; do
+    retina=$((size * 2))
+    /usr/bin/sips -z "$retina" "$retina" Branding/RateCue-Icon-1024.png --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
+done
+cp Branding/RateCue-Icon-1024.png "$iconset/icon_512x512@2x.png"
+/usr/bin/iconutil -c icns "$iconset" -o "$app/Contents/Resources/RateCue.icns"
 cp -p "$bin" "$staged"
 mv -f "$staged" "$app/Contents/MacOS/RateCue"
 rm -f "$app/Contents/MacOS/Damon"
@@ -29,4 +44,6 @@ else
 fi
 codesign --force --options runtime --entitlements Packaging/Damon.entitlements --sign "$sign_identity" "$app"
 codesign --verify --strict "$app"
-printf 'Built %s\n' "$app"
+rm -rf "$final_app"
+mv "$app" "$final_app"
+printf 'Built %s\n' "$final_app"
