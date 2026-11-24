@@ -13,10 +13,10 @@ plutil -lint Packaging/Info.plist Packaging/Damon.entitlements
 swift test
 sh Packaging/build-app.sh
 bundle=dist/RateCue.app/Contents
-"$bundle/MacOS/Damon" --help > /dev/null
+"$bundle/MacOS/RateCue" --help > /dev/null
 name=$(plutil -extract CFBundleName raw -o - "$bundle/Info.plist")
 version=$(plutil -extract CFBundleShortVersionString raw -o - "$bundle/Info.plist")
 build=$(plutil -extract CFBundleVersion raw -o - "$bundle/Info.plist")
-test "$("$bundle/MacOS/Damon" --version)" = "$name $version (build $build)"
+test "$("$bundle/MacOS/RateCue" --version)" = "$name $version (build $build)"
 cmp LICENSE "$bundle/Resources/LICENSE"
 cmp NOTICE "$bundle/Resources/NOTICE"

@@ -4,7 +4,7 @@ Use macOS 15 or later with a Swift 6 toolchain. The contributor checks do not ne
 
 1. Create a topic branch: `git switch -c your-topic`.
 2. Reproduce the behavior and add a focused regression test when changing format detection, transport, or alignment.
-3. Run `sh Scripts/check.sh` from the repository root. Use `swift test --filter '<test-name>'` for focused iteration. The full check rebuilds and signs `dist/RateCue.app`; its default ad-hoc signature may require permission reauthorization.
+3. Run `sh Scripts/check.sh` from the repository root. Use `swift test --filter '<test-name>'` for focused iteration. The full check rebuilds and signs `dist/RateCue.app` with the stable local `RateCue Local Development` identity when available; set `DAMON_SIGN_IDENTITY` for a different identity. Otherwise it warns and falls back to ad-hoc signing.
 4. Share the change with its purpose, test results, and any remaining live test conditions. Keep unrelated edits in separate commits.
 
 If hosted on GitHub, the [macOS workflow](.github/workflows/check.yml) runs the same checks for pushes and pull requests.
@@ -27,6 +27,6 @@ If hosted on GitHub, the [macOS workflow](.github/workflows/check.yml) runs the 
 
 ## Versioning and packaging
 
-The app and CLI read the product version and build from [`Packaging/Info.plist`](Packaging/Info.plist). Update those fields deliberately for releases; neither shell script auto-increments them or has a separate version number. Scripts are versioned with the project revision. `DAMON_SIGN_IDENTITY` optionally selects a signing identity; the default is ad hoc. Do not commit signing identities or credentials. Signing alone does not make a build sandboxed or notarized.
+The app and CLI read the product version and build from [`Packaging/Info.plist`](Packaging/Info.plist). Update those fields deliberately for releases; neither shell script auto-increments them or has a separate version number. Scripts are versioned with the project revision. `DAMON_SIGN_IDENTITY` optionally selects a signing identity; the preferred default is the local `RateCue Local Development` identity, with ad-hoc fallback. Do not commit signing identities or credentials. Signing alone does not make a build sandboxed or notarized.
 
 RateCue contributions use the repository's [GPL-3.0-only license](LICENSE). Submit only work you have the right to license. Keep third-party names, notices, and source attribution with any material you are authorized to redistribute. See [NOTICE](NOTICE) for LosslessSwitcher credit and provenance.

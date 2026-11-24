@@ -115,9 +115,28 @@ struct MusicPanelTests {
         #expect(!open)
     }
 
-    @Test func automaticReadNeverTouchesAnExistingOrUnobservablePanel() {
+    @Test func automaticReadReopensAnExistingPanelToEstablishFreshness() throws {
+        let reading = MusicFormatPanel.Reading(rate: 44_100, bitDepth: 24)
+        var state = 1
+        var presses = 0
+        var dismissals = 0
+        let result = try MusicFormatPanel.automaticRead(
+            inspect: {
+                .init(result: state == 0 ? .noOpenPanel : .reading(reading),
+                      badge: 1, panel: state == 0 ? nil : 2)
+            },
+            press: { _ in presses += 1; state = 1 },
+            dismiss: { _ in dismissals += 1; state = 0 },
+            same: ==, check: {}, now: { 0 }, sleep: { _ in }
+        )
+        #expect(result == reading)
+        #expect(presses == 1)
+        #expect(dismissals == 1)
+        #expect(state == 1)
+    }
+
+    @Test func automaticReadNeverTouchesAnUnobservablePanel() {
         let cases: [(MusicFormatPanel.Inspection<Int>, MusicFormatPanel.AutomaticError)] = [
-            (.init(result: .reading(.init(rate: 44_100, bitDepth: 24)), badge: 1, panel: 2), .alreadyOpen),
             (.init(result: .noOpenPanel, badge: 1, otherPanelOpen: true), .otherPanelOpen),
             (.init(result: .accessibilityDenied), .accessibilityDenied),
             (.init(result: .unavailable), .unavailable),
@@ -166,26 +185,28 @@ struct MusicPanelTests {
         #expect(presses == 1)
     }
 
-    @Test func automaticReadDoesNotOpenIfMusicBecomesActiveDuringPlaybackValidation() {
-        var active = false
+    @Test func automaticReadContinuesWhenPlaybackValidationSucceeds() throws {
         var validations = 0
         var presses = 0
-        #expect(throws: MusicFormatPanel.AutomaticError.musicInUse) {
-            _ = try MusicFormatPanel.automaticRead(
-                inspect: { .init(result: .noOpenPanel, badge: 1) },
-                press: { _ in presses += 1 }, dismiss: { _ in Issue.record("No panel was opened.") },
-                same: ==, check: {
-                    try MusicFormatPanel.checkAutomaticInteraction(checkAvailability: {
-                        if active { throw MusicFormatPanel.AutomaticError.musicInUse }
-                    }, validatePlayback: {
-                        validations += 1
-                        if validations == 2 { active = true }
-                    })
-                }, now: { 0 }, sleep: { _ in }
-            )
-        }
-        #expect(validations == 2)
-        #expect(presses == 0)
+        var open = false
+        let reading = MusicFormatPanel.Reading(rate: 44_100, bitDepth: 16)
+        let result = try MusicFormatPanel.automaticRead(
+            inspect: {
+                .init(result: open ? .reading(reading) : .noOpenPanel,
+                      badge: 1, panel: open ? 2 : nil)
+            },
+            press: { _ in presses += 1; open = true },
+            dismiss: { _ in presses += 1; open = false },
+            same: ==,
+            check: {
+                try MusicFormatPanel.checkAutomaticInteraction(
+                    checkAvailability: {}, validatePlayback: { validations += 1 }
+                )
+            }, now: { 0 }, sleep: { _ in }
+        )
+        #expect(result == reading)
+        #expect(validations > 0)
+        #expect(presses == 2)
     }
 
     @Test func automaticReadDoesNotDismissIfCancelledDuringPlaybackValidation() {

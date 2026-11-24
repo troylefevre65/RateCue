@@ -13,8 +13,7 @@ public struct FormatDisplay {
     public let certainty: Certainty
 
     public init(
-        verified: Format, playback: Playback?, panel: PanelFormatSnapshot? = nil, epoch: Epoch? = nil,
-        suppressPanel: Bool = false
+        verified: Format, playback: Playback?, panel: PanelFormatSnapshot? = nil, epoch: Epoch? = nil
     ) {
         if playback?.state != .playing {
             format = Format()
@@ -22,7 +21,7 @@ public struct FormatDisplay {
         } else if verified.rate != nil || verified.depth != nil {
             format = verified
             certainty = .verified
-        } else if !suppressPanel, let epoch, let format = panel?.matchingFormat(playback: playback, epoch: epoch) {
+        } else if let epoch, let format = panel?.matchingFormat(playback: playback, epoch: epoch) {
             self.format = format
             certainty = .panelSnapshot
         } else if let rate = playback?.reportedRate, rate > 0 {

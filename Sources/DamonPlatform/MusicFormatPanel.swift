@@ -28,7 +28,7 @@ public enum MusicFormatPanel {
     }
 
     public enum AutomaticError: LocalizedError, Equatable {
-        case accessibilityDenied, unavailable, inspectionFailed(String), musicInUse, alreadyOpen, otherPanelOpen, panelChanged
+        case accessibilityDenied, unavailable, inspectionFailed(String), otherPanelOpen, panelChanged
         case timedOut, unrecognizedFormat, depthNotShown, actionFailed(Int32), closeUnconfirmed(String)
 
         public var errorDescription: String? {
@@ -36,8 +36,6 @@ public enum MusicFormatPanel {
             case .accessibilityDenied: "Accessibility access is not enabled."
             case .unavailable: "Music's Now Playing view is unavailable."
             case let .inspectionFailed(detail): detail
-            case .musicInUse: "Music is active; automatic panel reading was skipped to avoid interrupting you."
-            case .alreadyOpen: "Music's Lossless panel is already open; close it before the next automatic check."
             case .otherPanelOpen: "Another Music panel is open; automatic reading was skipped."
             case .panelChanged: "Music's panel changed during the automatic check."
             case .timedOut: "Music's Lossless panel did not open in time."
@@ -201,8 +199,7 @@ public enum MusicFormatPanel {
             check: {
                 try checkAutomaticInteraction(checkAvailability: {
                     guard !Task.isCancelled else { throw CancellationError() }
-                    guard let music = NSRunningApplication(processIdentifier: pid) else { throw AutomaticError.unavailable }
-                    guard !music.isActive else { throw AutomaticError.musicInUse }
+                    guard NSRunningApplication(processIdentifier: pid) != nil else { throw AutomaticError.unavailable }
                 }, validatePlayback: validatePlayback)
             },
             now: { ProcessInfo.processInfo.systemUptime },
@@ -231,11 +228,77 @@ public enum MusicFormatPanel {
                 sleep(min(0.15, max(0, deadline - now())))
             }
         }
-        let initial = try observe(until: now() + 3)
+        var initial = try observe(until: now() + 3)
+        var restoreExistingPanel = false
+        if case .reading = initial.result, let badge = initial.badge, let panel = initial.panel {
+            guard !initial.otherPanelOpen else { throw AutomaticError.otherPanelOpen }
+            restoreExistingPanel = true
+            try check()
+            try dismiss(panel)
+            let closeDeadline = now() + 1.5
+            while true {
+                try check()
+                let closed = try observe(until: closeDeadline)
+                switch closed.result {
+                case .noOpenPanel: break
+                case .accessibilityDenied: throw AutomaticError.accessibilityDenied
+                case .unavailable:
+                    guard now() < closeDeadline else {
+                        throw AutomaticError.closeUnconfirmed(closed.issue ?? "Music's view could not be read.")
+                    }
+                    sleep(min(0.1, max(0, closeDeadline - now())))
+                    continue
+                case .reading, .unrecognizedFormat:
+                    guard let currentBadge = closed.badge, same(badge, currentBadge),
+                          let currentPanel = closed.panel, same(panel, currentPanel) else {
+                        throw AutomaticError.panelChanged
+                    }
+                    guard now() < closeDeadline else {
+                        throw AutomaticError.closeUnconfirmed("Music's Lossless panel is still open.")
+                    }
+                    sleep(min(0.1, max(0, closeDeadline - now())))
+                    continue
+                }
+                break
+            }
+            initial = try observe(until: now() + 3)
+        } else if case .unrecognizedFormat = initial.result, let badge = initial.badge, let panel = initial.panel {
+            guard !initial.otherPanelOpen else { throw AutomaticError.otherPanelOpen }
+            restoreExistingPanel = true
+            try check()
+            try dismiss(panel)
+            let closeDeadline = now() + 1.5
+            while true {
+                try check()
+                let closed = try observe(until: closeDeadline)
+                switch closed.result {
+                case .noOpenPanel: break
+                case .accessibilityDenied: throw AutomaticError.accessibilityDenied
+                case .unavailable:
+                    guard now() < closeDeadline else {
+                        throw AutomaticError.closeUnconfirmed(closed.issue ?? "Music's view could not be read.")
+                    }
+                    sleep(min(0.1, max(0, closeDeadline - now())))
+                    continue
+                case .reading, .unrecognizedFormat:
+                    guard let currentBadge = closed.badge, same(badge, currentBadge),
+                          let currentPanel = closed.panel, same(panel, currentPanel) else {
+                        throw AutomaticError.panelChanged
+                    }
+                    guard now() < closeDeadline else {
+                        throw AutomaticError.closeUnconfirmed("Music's Lossless panel is still open.")
+                    }
+                    sleep(min(0.1, max(0, closeDeadline - now())))
+                    continue
+                }
+                break
+            }
+            initial = try observe(until: now() + 3)
+        }
         switch initial.result {
         case .accessibilityDenied: throw AutomaticError.accessibilityDenied
         case .unavailable: throw initial.issue.map(AutomaticError.inspectionFailed) ?? AutomaticError.unavailable
-        case .reading, .unrecognizedFormat: throw AutomaticError.alreadyOpen
+        case .reading, .unrecognizedFormat: throw AutomaticError.panelChanged
         case .noOpenPanel: break
         }
         guard !initial.otherPanelOpen else { throw AutomaticError.otherPanelOpen }
@@ -282,6 +345,9 @@ public enum MusicFormatPanel {
         default: throw AutomaticError.panelChanged
         }
         try check()
+        if restoreExistingPanel {
+            return try outcome.get()
+        }
         try dismiss(panel)
         let closeDeadline = now() + 1.5
         while true {

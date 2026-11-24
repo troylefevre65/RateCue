@@ -23,7 +23,7 @@ Requires macOS 15 or later, Xcode 16 or later with its command-line tools select
 sh Scripts/check.sh
 ```
 
-This validates the packaging plists, runs the Swift tests, then builds and verifies `dist/RateCue.app`. The default signature is ad hoc; setting `DAMON_SIGN_IDENTITY` selects a signing identity instead. The development build is not sandboxed or notarized. Rebuilding replaces the bundled executable and may require renewed macOS permissions. Quit the old Damon or RateCue app before opening the rebuilt bundle. The bundle identifier (`org.damon.BitStreamManager`) and CLI executable name (`Damon`) remain unchanged for compatibility.
+This validates the packaging plists, runs the Swift tests, then builds and verifies `dist/RateCue.app`. When available, it uses the `RateCue Local Development` code-signing identity so macOS permission grants remain stable across rebuilds; setting `DAMON_SIGN_IDENTITY` selects another identity. On a machine without either identity, it falls back to ad-hoc signing and rebuild permissions may change. The development build is not sandboxed or notarized. Quit the old app before opening the rebuilt bundle. The bundle identifier (`org.damon.BitStreamManager`) remains unchanged for preference compatibility; the CLI executable is named `RateCue`.
 
 Open RateCue from Finder, start Music, and enable **Monitor Apple Music** in the menu bar. Handle the macOS Automation prompt if shown. Select a preferred output under **Select Output Device**; RateCue remembers its UID but does not change the system output route. For local-file source-format evidence, choose an audio file or a dedicated fixture folder under **Choose Authorized Local Audio**.
 
@@ -31,7 +31,7 @@ Open RateCue from Finder, start Music, and enable **Monitor Apple Music** in the
 
 For a manual estimate, open Music's Lossless panel on the current track and choose **Read Open Music Lossless Panel… → Display Estimate**. Alternatively, choose **Read Fresh Music Lossless Panel…**, then manually open the badge when RateCue prompts you. The timed fresh-panel workflow has timed out in a live trial. Both manual checks only read the interface. An open panel can retain the previous track's format, and even a newly opened panel is not proven to describe the delivered rendition.
 
-For experimental automatic estimates, enable **Automatically Read Music Panel (Experimental)**. Leave Music's Now Playing view available with its Lossless panel closed, and switch away from Music. RateCue attempts a read on playback, route, or reported-rate changes and after Music loses focus; it may open and close the panel. It clears the snapshot while Music has focus, skips an already open panel, and can leave the panel open if interrupted. Turning off monitoring or automatic panel reading cancels an in-flight automatic read. Failed checks appear under **Automatic depth** or **Logs**; toggle the feature off and on to retry the current track.
+For experimental automatic estimates, enable **Automatically Read Music Panel (Experimental)**. Leave Music's Now Playing view available. After playback, route, or reported-rate changes, RateCue opens and reads a closed Lossless panel, or closes and reopens an existing panel to establish freshness, including while Music is active. It restores the open state when a panel was already open. While depth remains unknown, it retries periodically. Existing snapshots remain visible until those changes invalidate them. Turning off monitoring or automatic panel reading cancels an in-flight automatic read, which can leave the panel closed or open during an interrupted interaction. Failed checks appear under **Automatic depth** or **Logs**.
 
 Panel reading requires Accessibility access and a recognizable Music Now Playing layout and ALAC format text. It may fail with other layouts or localizations. If depth is omitted, ambiguous, or conflicts with Music's track rate, RateCue leaves it unknown. Panel estimates stay amber and never authorize device changes. Live automatic snapshots have been displayed, but same-rate 16/24-bit attribution has not been independently qualified.
 
@@ -42,7 +42,7 @@ Use **Accessibility Access…** to check or request access for the running build
 The bundled executable is also a CLI:
 
 ```sh
-ratecue=./dist/RateCue.app/Contents/MacOS/Damon
+ratecue=./dist/RateCue.app/Contents/MacOS/RateCue
 "$ratecue" --version
 "$ratecue" --help
 "$ratecue" devices
@@ -77,8 +77,8 @@ See the [test plan](PLAN.md#cli-configuration-and-tests) for configuration synta
 ## Troubleshooting
 
 - **Music Automation denied:** grant access under **Privacy & Security → Automation**. The bundled app and terminal-launched CLI may require separate grants; `authorize-music` requests access for the CLI.
-- **Accessibility enabled but RateCue reports denied:** check **Accessibility Access…** for the running build. Ad-hoc rebuilds may require removing and re-adding this exact `RateCue.app` in the relevant Privacy & Security page; handle system authentication yourself.
-- **Automatic depth waits or shows `—`:** Music must be playing with Now Playing available and its Lossless panel closed. With the experiment enabled, the snapshot is deliberately hidden while Music is active. Check **Automatic depth** and **Logs** for failures.
+- **Accessibility enabled but RateCue reports denied:** check **Accessibility Access…** for the running build. Development builds should use the persistent `RateCue Local Development` signing identity; if a different identity was used, restore that identity before reauthorizing the exact `RateCue.app`.
+- **Automatic depth waits or shows `—`:** Music must be playing with Now Playing available. The automatic reader can reopen an open panel or briefly open a closed panel, even while Music is active. Check **Automatic depth** and **Logs** for failures.
 - **Preferred device unavailable or route unconfirmed:** reconnect or select the intended device and check Music's actual output. RateCue does not silently select a replacement or reroute audio.
 - **Sensors unavailable:** camera and microphone verification requires a valid calibrated profile and separate permission; the packaged profile list is empty.
 

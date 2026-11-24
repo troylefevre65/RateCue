@@ -3,8 +3,8 @@ import Foundation
 
 public enum DamonCLI {
     private static let usage = """
-    RateCue CLI (Damon executable)
-    Usage: Damon <command>
+    RateCue CLI
+    Usage: RateCue <command>
 
       --version                                    Show the application version and build.
       devices                                      List Core Audio outputs as JSON.
@@ -188,7 +188,7 @@ public enum DamonCLI {
             case "test-switch":
                 return try runSwitchTrial(Array(args.dropFirst()), store: store)
             default:
-                throw CommandError("Unknown command '\(args.first ?? "")'. Run 'Damon --help' for usage.")
+                throw CommandError("Unknown command '\(args.first ?? "")'. Run 'RateCue --help' for usage.")
             }
             return 0
         } catch {
@@ -362,9 +362,9 @@ public enum DamonCLI {
         let byUID = devices.filter { $0.uid == selector }
         let matches = byUID.isEmpty ? devices.filter { $0.name == selector } : byUID
         guard let device = matches.first else {
-            throw CommandError("No connected output matches '\(selector)'. Run 'Damon devices' to list outputs.")
+            throw CommandError("No connected output matches '\(selector)'. Run 'RateCue devices' to list outputs.")
         }
-        guard matches.count == 1 else { throw CommandError("'\(selector)' is ambiguous. Select an exact UID from 'Damon devices'.") }
+        guard matches.count == 1 else { throw CommandError("'\(selector)' is ambiguous. Select an exact UID from 'RateCue devices'.") }
         return device
     }
 
@@ -402,7 +402,7 @@ public enum DamonCLI {
     }
 
     private static func requireArgumentCount(_ args: [String], _ count: Int) throws {
-        guard args.count == count else { throw CommandError("Unexpected arguments. Run 'Damon --help' for usage.") }
+        guard args.count == count else { throw CommandError("Unexpected arguments. Run 'RateCue --help' for usage.") }
     }
 
     private static func printJSON(_ value: some Encodable) throws {

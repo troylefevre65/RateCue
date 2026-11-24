@@ -4,7 +4,7 @@ import PackageDescription
 let package = Package(
     name: "Damon",
     platforms: [.macOS(.v15)],
-    products: [.executable(name: "Damon", targets: ["Damon"])],
+    products: [.executable(name: "RateCue", targets: ["Damon"])],
     targets: [
         .target(name: "DamonPolicy"),
         .target(name: "DamonPlatform", dependencies: ["DamonPolicy"]),

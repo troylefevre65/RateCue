@@ -49,6 +49,7 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var panelPrompt: String?
     private var automaticPanelTask: Task<Void, Never>?
     private var automaticPanelAttemptEpoch: Epoch?
+    private var automaticPanelRetryAt: TimeInterval?
     private var automaticPanelStatus: String?
     private var lastMessage = ""
     private var permissionMessage: String?
@@ -132,6 +133,7 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if previous?.playback?.reportedRate != sample.playback?.reportedRate {
             automaticPanelTask?.cancel()
             automaticPanelAttemptEpoch = nil
+            automaticPanelRetryAt = nil
             automaticPanelStatus = nil
             panelSnapshot = nil
         }
@@ -219,7 +221,6 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             appendLog(message)
             lastMessage = message
         }
-        clearPanelWhileMusicIsActive()
         scheduleAutomaticPanelRead()
         updateButton()
     }
@@ -243,6 +244,7 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if next.invalidatesAutomaticPanelRead(comparedTo: settings) {
                 automaticPanelTask?.cancel()
                 automaticPanelAttemptEpoch = nil
+                automaticPanelRetryAt = nil
                 automaticPanelStatus = nil
                 if next.monitorMusic != automation { panelSnapshot = nil }
             }
@@ -280,9 +282,7 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func formatDisplay() -> FormatDisplay {
-        let musicActive = NSWorkspace.shared.frontmostApplication?.bundleIdentifier == musicBundleID
-        return FormatDisplay(verified: currentFormat, playback: previous?.playback, panel: panelSnapshot, epoch: epoch,
-                             suppressPanel: settings.autoReadMusicPanel && musicActive)
+        FormatDisplay(verified: currentFormat, playback: previous?.playback, panel: panelSnapshot, epoch: epoch)
     }
 
     private func updateButton() {
@@ -405,7 +405,7 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let prompt = NSAlert()
         prompt.messageText = "Automatically read Music's Lossless panel?"
         prompt.informativeText = """
-            This experimental feature opens and closes Music's Lossless panel for a playing track when Music is not active. It clears the snapshot while Music is active, skips a panel that is already open, and may leave the panel open if playback or Music's interface changes.
+            This experimental feature reads Music's Lossless panel after playback, route, or reported-rate changes, including while Music is active. It opens a closed panel or closes and reopens an existing panel to establish freshness, then restores the open state. The interaction can be interrupted by playback or interface changes.
 
             Music's Now Playing view must be available and RateCue needs Accessibility access. The result can be stale, remains amber and unverified, and never authorizes a DAC rate change.
             """
@@ -569,37 +569,25 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func handleApplicationActivation() {
         guard settings.autoReadMusicPanel else { return }
-        clearPanelWhileMusicIsActive()
         updateButton()
         audioRefresh.signal()
     }
 
-    private func clearPanelWhileMusicIsActive() {
-        guard settings.autoReadMusicPanel,
-              NSWorkspace.shared.frontmostApplication?.bundleIdentifier == musicBundleID else { return }
-        // A visible Music panel can retain the previous track's depth across a change.
-        panelSnapshot = nil
-        automaticPanelTask?.cancel()
-        automaticPanelAttemptEpoch = nil
-        automaticPanelStatus = "Waiting until Music is not active."
-    }
-
     private func scheduleAutomaticPanelRead() {
         guard settings.autoReadMusicPanel, automation, panelTask == nil, automaticPanelTask == nil,
-              automaticPanelAttemptEpoch != epoch, panelSnapshot == nil,
+              panelSnapshot == nil,
+              automaticPanelAttemptEpoch != epoch
+                || automaticPanelRetryAt.map({ $0 <= ProcessInfo.processInfo.systemUptime }) == true,
               currentFormat.rate == nil, currentFormat.depth == nil,
               let pid = previousMusicPID, let playback = previous?.playback, playback.state == .playing,
               let trackID = playback.trackID else { return }
-        guard let music = NSRunningApplication(processIdentifier: pid) else {
+        guard NSRunningApplication(processIdentifier: pid) != nil else {
             automaticPanelStatus = "Music is unavailable."
-            return
-        }
-        guard !music.isActive else {
-            automaticPanelStatus = "Waiting until Music is not active."
             return
         }
         let selectedEpoch = epoch
         automaticPanelAttemptEpoch = selectedEpoch
+        automaticPanelRetryAt = nil
         automaticPanelStatus = "Reading Music's panel…"
         automaticPanelTask = Task { [weak self] in
             let worker = Task.detached {
@@ -613,10 +601,15 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                   self.epoch == selectedEpoch, self.previousMusicPID == pid else { return }
             switch outcome {
             case let .success(reading):
-                self.acceptPanelReading(reading, epoch: selectedEpoch, trackID: trackID, pid: pid, automatic: true)
+                if !self.acceptPanelReading(
+                    reading, epoch: selectedEpoch, trackID: trackID, pid: pid, automatic: true
+                ) {
+                    self.automaticPanelRetryAt = ProcessInfo.processInfo.systemUptime + 2
+                }
             case let .failure(error):
                 let message = "\(error.localizedDescription) Music's panel may remain open."
                 self.automaticPanelStatus = message
+                self.automaticPanelRetryAt = ProcessInfo.processInfo.systemUptime + 2
                 self.appendLog("Automatic panel read: \(message)")
                 self.updateButton()
             }
@@ -758,9 +751,10 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    @discardableResult
     private func acceptPanelReading(
         _ reading: MusicFormatPanel.Reading, epoch selectedEpoch: Epoch, trackID: String, pid: pid_t, automatic: Bool = false
-    ) {
+    ) -> Bool {
         func fail(_ title: String, _ detail: String) {
             updateButton()
             if automatic {
@@ -773,19 +767,20 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard automation, epoch == selectedEpoch, previousMusicPID == pid,
               previous?.playback?.state == .playing, previous?.playback?.trackID == trackID else {
             fail("Music changed during the panel check", "No bit-depth snapshot was saved because playback changed.")
-            return
+            return false
         }
         guard let depth = reading.bitDepth else {
             fail("Bit depth not shown", "Music's panel did not report a bit depth. RateCue will not infer one.")
-            return
+            return false
         }
         if let rate = previous?.playback?.reportedRate, rate != reading.rate {
             fail("Music format readings disagree", "The panel and track sample-rate readings differ, so no bit-depth snapshot was saved.")
-            return
+            return false
         }
         panelSnapshot = PanelFormatSnapshot(format: Format(rate: reading.rate, depth: depth), epoch: selectedEpoch, trackID: trackID)
         if automatic { automaticPanelStatus = "Unverified Music panel snapshot." }
         updateButton()
+        return true
     }
 
     @objc private func toggleLogin() {
@@ -836,7 +831,7 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             Green indicates a qualified local source format. Amber with ≈ is an unverified Music-reported rate or panel snapshot; — means unknown. Status can still say Unknown Format when an amber estimate is displayed. A matching rate alone does not prove bit-perfect playback.
 
             Music panel and permissions
-            Use Accessibility Access to check or request permission. Open Music's Lossless panel and choose Read Open Music Lossless Panel to display a user-confirmed amber snapshot. Automatically Read Music Panel is opt-in and experimental: it clears the snapshot while Music has focus, then tries again after you switch away. The panel may be stale. Use Copy Diagnostics to copy a status summary.
+            Use Accessibility Access to check or request permission. Open Music's Lossless panel and choose Read Open Music Lossless Panel to display a user-confirmed amber snapshot. Automatically Read Music Panel is opt-in and experimental: after playback, route, or reported-rate changes it briefly opens and closes the panel, even while Music is active. Those changes invalidate the old snapshot. Use Copy Diagnostics to copy a status summary.
 
             Local files and verification
             Use Choose Authorized Local Audio to inspect a file or a dedicated fixture folder. Catalog source depth and automatic catalog switching remain unqualified. Camera and microphone verification requires a calibrated device profile and separate permission. Check for Updates is a placeholder in this build.
@@ -868,7 +863,7 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 let arguments = CommandLine.arguments.dropFirst().filter { !$0.hasPrefix("-psn_") }
 if let command = arguments.first, ["--make-fixtures", "--make-qualification-kit"].contains(command) {
     guard arguments.count == 2 else {
-        FileHandle.standardError.write(Data("Usage: Damon \(command) <new-folder>\n".utf8))
+        FileHandle.standardError.write(Data("Usage: RateCue \(command) <new-folder>\n".utf8))
         exit(2)
     }
     do {
@@ -894,7 +889,7 @@ if arguments.first == "--compare-pcm" {
               let parsed = Int64(arguments[4]), parsed >= 0 {
         offset = parsed
     } else {
-        FileHandle.standardError.write(Data("Usage: Damon --compare-pcm <reference> <candidate> [--offset-frames <nonnegative-integer>]\n".utf8))
+        FileHandle.standardError.write(Data("Usage: RateCue --compare-pcm <reference> <candidate> [--offset-frames <nonnegative-integer>]\n".utf8))
         exit(2)
     }
     do {

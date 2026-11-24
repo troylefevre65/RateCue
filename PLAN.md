@@ -76,17 +76,17 @@ From the project directory:
 ```sh
 swift test
 sh Packaging/build-app.sh
-dist/RateCue.app/Contents/MacOS/Damon --diagnose
+dist/RateCue.app/Contents/MacOS/RateCue --diagnose
 ```
 
-The build script compiles the release target, creates or updates `dist/RateCue.app`, and verifies its signature. By default it uses an ad-hoc development signature. Set `DAMON_SIGN_IDENTITY` to a suitable signing identity for a signed qualification build. The current build is not sandboxed or notarized. Version and build come from `CFBundleShortVersionString` and `CFBundleVersion` in `Packaging/Info.plist`; the scripts do not increment them and are versioned with the project revision. Rebuilding can require reauthorization of the new signed code. The `--diagnose` command only reads Core Audio output capabilities. It does not send Music events, start either sensor, or change audio settings.
+The build script compiles the release target, creates or updates `dist/RateCue.app`, and verifies its signature. It uses the local `RateCue Local Development` identity when available, permits an explicit `DAMON_SIGN_IDENTITY`, and otherwise warns and falls back to ad-hoc signing. The current build is not sandboxed or notarized. Version and build come from `CFBundleShortVersionString` and `CFBundleVersion` in `Packaging/Info.plist`; the scripts do not increment them and are versioned with the project revision. Stable-identity rebuilds preserve macOS permission requirements; ad-hoc rebuilds can require reauthorization. The `--diagnose` command only reads Core Audio output capabilities. It does not send Music events, start either sensor, or change audio settings.
 
 ### CLI configuration and tests
 
 From the project directory, use the bundled executable without launching the menu app:
 
 ```sh
-ratecue=./dist/RateCue.app/Contents/MacOS/Damon
+ratecue=./dist/RateCue.app/Contents/MacOS/RateCue
 "$ratecue" --help
 "$ratecue" devices
 "$ratecue" config show
@@ -115,7 +115,7 @@ With an Apple Music catalog track playing, use `"$ratecue" probe-format` to read
 
 For a stronger read-only observation, close Music's Lossless panel, then run `"$ratecue" probe-format --fresh-panel`. After the command says it is waiting, manually open Music's Lossless badge within 15 seconds. The command confirms the panel was initially closed, checks playback and track identity around each read, and rejects unavailable accessibility data, an existing panel, a changed track, or an ambiguous format. `openedDuringProbe` means those sampled checks passed; it is not continuous proof that Music's panel reflects the delivered rendition. Both panel modes are diagnostic only and never authorize switching. Neither opens the panel, prompts for permissions, logs track identifiers or paths, or changes playback.
 
-The menu's **Read Fresh Music Lossless Panel…** uses the same check. Alternatively, **Read Open Music Lossless Panel…** lets the user explicitly display the reading after warning that an open panel may be stale. Both paths check the Music track around the read. If Music explicitly reports bit depth, RateCue shows the reading as an amber snapshot for the current playback instance. It clears on playback, route, or reported-rate changes and refuses to combine a panel reading with a conflicting track rate. With the experimental automatic reader enabled, the snapshot also clears while Music is active. The snapshot is not qualified source evidence and cannot authorize a rate write.
+The menu's **Read Fresh Music Lossless Panel…** uses the same check. Alternatively, **Read Open Music Lossless Panel…** lets the user explicitly display the reading after warning that an open panel may be stale. Both paths check the Music track around the read. If Music explicitly reports bit depth, RateCue shows the reading as an amber snapshot for the current playback instance. It clears on playback, route, or reported-rate changes and refuses to combine a panel reading with a conflicting track rate. A still-valid snapshot remains visible while Music is active, and the experimental reader can refresh it without waiting for a focus change. The snapshot is not qualified source evidence and cannot authorize a rate write.
 
 The first live menu check was blocked by missing Accessibility permission. On the test Mac, the relevant Privacy & Security page is named **Device Control and Data Access**, not Accessibility. After the user re-added the current build, RateCue's **Accessibility Access…** check reported access enabled. A subsequent live panel scan reported that Music's panel could not be observed reliably. Music's accessible window included a large play queue; the revised scanner searches the bounded Now Playing region instead, with a synthetic large-queue regression. Development builds are ad-hoc signed, so a changed build may need a renewed grant.
 
@@ -123,9 +123,9 @@ On November 21, 2026, after reauthorizing and restarting the rebuilt app, the us
 
 The user later reported that Music's panel showed 16-bit / 44.1 kHz while RateCue displayed `≈44.1k / —`. This is consistent with clearing the earlier snapshot, but does not establish why it was cleared or demonstrate automatic detection of the new depth.
 
-An opt-in experimental automatic reader attempts to open and close a previously closed Lossless panel once per playback, route, or reported-rate change, only while Music is not active. It checks playback identity, refuses existing or ambiguous panels, and reports failures in the menu and logs. A cancelled check can leave the panel open. In a live trial, the original badge-toggle close could not be confirmed, so no depth was displayed. After switching to Music's exposed popover-cancel action, the user reported an automatic `≈192k / 24` snapshot. On the next song the reader instead reported an `AXWindows` timeout and showed unknown depth, while Music's manually opened panel reported 16-bit / 44.1 kHz. After adding bounded retries for transient Accessibility observations, the user reported automatic snapshots including `≈96k / 24`, `≈44.1k / 16`, and `≈48k / 24`.
+An opt-in experimental automatic reader checks the Lossless panel once per playback, route, or reported-rate change, including while Music is active. It opens a closed panel or closes and reopens an existing panel so freshness is tied to a panel opened during the check, then restores the prior open state. It checks playback identity around the read, rejects ambiguous or changing panels, reports failures in the menu and logs, and retries rejected reads while depth remains unknown. A cancelled interaction can temporarily leave the panel in either state. In a live trial, the original badge-toggle close could not be confirmed, so no depth was displayed. After switching to Music's exposed popover-cancel action, the user reported an automatic `≈192k / 24` snapshot. On the next song the reader instead reported an `AXWindows` timeout and showed unknown depth, while Music's manually opened panel reported 16-bit / 44.1 kHz. After adding bounded retries for transient Accessibility observations, the user reported automatic snapshots including `≈96k / 24`, `≈44.1k / 16`, and `≈48k / 24`.
 
-The user also observed the previous song's 16-bit estimate remaining visible while Music was active, until switching away. The revised experimental mode clears and suppresses panel snapshots when Music becomes active and requests a new read after focus leaves Music. In a live retry, the user confirmed that the menu bar showed unknown depth while Music had focus and reported an automatic `≈48k / 24` snapshot after switching away. These observations are not independent proof of active catalog rendition depth. Same-rate 16/24-bit changes, rapid skips, interruption, and permission revocation remain unqualified.
+The user observed that clearing a valid snapshot solely because Music became active made bit depth disappear during active inspection. The experimental mode now preserves a snapshot that still matches the current track, playback epoch, route epoch, and reported rate, and refreshes it without requiring a focus change. These observations are not independent proof of active catalog rendition depth. Same-rate 16/24-bit changes, rapid skips, interruption, and permission revocation remain unqualified.
 
 ### Lessons for future work
 
@@ -161,7 +161,7 @@ The live transport smoke test confirmed pause, resume, and one advance to a dist
 With Music running, Automation authorized, and Auto Switch off, run:
 
 ```sh
-ratecue=./dist/RateCue.app/Contents/MacOS/Damon
+ratecue=./dist/RateCue.app/Contents/MacOS/RateCue
 "$ratecue" test-fixture --kit dist/QualificationKit --device "Eitr 2"
 ```
 
@@ -170,7 +170,7 @@ The command generates the kit if the requested folder does not exist, checks the
 To generate the kit separately, use a **new** destination. The kit includes a JSON manifest with expected rates, bit depths, and frame counts. Both 44.1 kHz files and the 96 kHz file are 60 seconds long; the other four are 12 seconds each.
 
 ```sh
-dist/RateCue.app/Contents/MacOS/Damon --make-qualification-kit dist/QualificationKit
+dist/RateCue.app/Contents/MacOS/RateCue --make-qualification-kit dist/QualificationKit
 afinfo dist/QualificationKit/ALAC/Damon-96000Hz-24bit.m4a
 ```
 
@@ -186,7 +186,7 @@ RateCue accepts the stereo integer PCM or ALAC source header only when it agrees
 This separate lab command makes temporary Core Audio writes. Stop Music first, leave regular Auto Switch off, and use an externally connected device already set to 44.1 kHz. Do not run it on a shared output carrying active audio from another app.
 
 ```sh
-dist/RateCue.app/Contents/MacOS/Damon test-switch \
+dist/RateCue.app/Contents/MacOS/RateCue test-switch \
   --kit dist/QualificationKit --device "Eitr 2" --allow-rate-write
 ```
 
@@ -211,7 +211,7 @@ The menu app and trial now share the direct readback and continuity checks. The 
 The generator validates each ALAC fixture by decoding and comparing every sample against the corresponding WAV. For a live integrity test, use a separate digital recorder or analyzer that preserves the target link's native samples. Compare its result offline:
 
 ```sh
-dist/RateCue.app/Contents/MacOS/Damon --compare-pcm \
+dist/RateCue.app/Contents/MacOS/RateCue --compare-pcm \
   dist/QualificationKit/PCM/Damon-96000Hz-24bit.wav capture.wav
 ```
 
@@ -222,7 +222,7 @@ Qualification so far:
 | Gate | Evidence and status |
 | --- | --- |
 | Source-format and decision replay | Swift tests cover CLI preference updates, qualification checks, changed samples, short capture windows, and lossless integer padding. Every generated ALAC fixture decodes to the exact matching WAV samples. Apple Event specifier construction passed; this does not establish live Music Automation behavior. |
-| Apple Music catalog formats | Manually opened Lossless panels have exposed an ALAC rate both with and without bit depth. Manual and experimental automatic amber snapshots have been displayed; the latter clears while Music has focus. The closed badge exposed only the quality label. No continuously available, rendition-bound provider has been established. Catalog auto-switching is not supported by this build. |
+| Apple Music catalog formats | Manually opened Lossless panels have exposed an ALAC rate both with and without bit depth. Manual and experimental automatic amber snapshots have been displayed and remain visible while valid, including while Music has focus. The closed badge exposed only the quality label. No continuously available, rendition-bound provider has been established. Catalog auto-switching is not supported by this build. |
 | Live route and writes | The read-only local trial verified the exact 96 kHz / 24-bit fixture and Eitr 2 Music route. A separate explicitly authorized lab trial passed with two timed writes and zero writes for a depth-only change. It restored the original rate. This qualifies only that controlled hardware trial; regular Auto Switch remains disabled on unqualified routes. No Thunderbolt audio device was present. |
 | Profile-based sensors | The app includes opt-in camera and microphone adapters and replay-tested correlation rules. No calibrated profile or held-out live sensor trials exist yet. Capture remains disabled without a profile. |
 | Launch and idle spot check | The ad-hoc-signed app launched on the Apple Silicon test host. A short idle sample showed 0.0–0.2% CPU and 18 MB resident memory. The user reported unknown source fields while Music was playing, but the Automation and route status were not confirmed. |

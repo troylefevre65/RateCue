@@ -228,13 +228,13 @@ struct DamonTests {
     }
 
     @MainActor
-    @Test func activeMusicSuppressesTheExperimentalPanelSnapshot() {
+    @Test func activeMusicKeepsAValidExperimentalPanelSnapshotVisible() {
         let playback = Playback(state: .playing, trackID: "catalog", position: nil, file: nil, reportedRate: 44_100)
         let snapshot = PanelFormatSnapshot(format: Format(rate: 44_100, depth: 16), epoch: epoch, trackID: "catalog")
-        let display = FormatDisplay(verified: Format(), playback: playback, panel: snapshot, epoch: epoch, suppressPanel: true)
-        #expect(display.statusBarTitle(showRate: true, showDepth: true, warning: false).string == "≈44.1k / —")
+        let display = FormatDisplay(verified: Format(), playback: playback, panel: snapshot, epoch: epoch)
+        #expect(display.statusBarTitle(showRate: true, showDepth: true, warning: false).string == "≈44.1k / 16")
         let qualified = FormatDisplay(verified: Format(rate: 44_100, depth: 24), playback: playback, panel: snapshot,
-                                      epoch: epoch, suppressPanel: true)
+                                      epoch: epoch)
         #expect(qualified.certainty == .verified)
         #expect(qualified.format.depth == 24)
     }
