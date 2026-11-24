@@ -6,6 +6,7 @@ public struct FormatDisplay {
         case verified = "Verified source format"
         case estimated = "Music-reported rate, unverified"
         case panelSnapshot = "Music panel snapshot, unverified"
+        case correlated = "Correlated bit depth, unverified"
         case unknown = "Unknown source format"
     }
 
@@ -13,7 +14,8 @@ public struct FormatDisplay {
     public let certainty: Certainty
 
     public init(
-        verified: Format, playback: Playback?, panel: PanelFormatSnapshot? = nil, epoch: Epoch? = nil
+        verified: Format, playback: Playback?, panel: PanelFormatSnapshot? = nil, epoch: Epoch? = nil,
+        depthEstimate: DepthResolution? = nil
     ) {
         if playback?.state != .playing {
             format = Format()
@@ -24,6 +26,10 @@ public struct FormatDisplay {
         } else if let epoch, let format = panel?.matchingFormat(playback: playback, epoch: epoch) {
             self.format = format
             certainty = .panelSnapshot
+        } else if let rate = playback?.reportedRate, rate > 0,
+                  let depth = depthEstimate?.candidate?.rawValue {
+            format = Format(rate: rate, depth: depth)
+            certainty = .correlated
         } else if let rate = playback?.reportedRate, rate > 0 {
             format = Format(rate: rate)
             certainty = .estimated
@@ -37,12 +43,13 @@ public struct FormatDisplay {
     public func statusBarTitle(showRate: Bool, showDepth: Bool, warning: Bool) -> NSAttributedString {
         let label = format.label(showRate: showRate, showDepth: showDepth)
         let showsKnownField = (showRate && format.rate != nil) || (showDepth && format.depth != nil)
-        let text = ((certainty == .estimated || certainty == .panelSnapshot) && showsKnownField ? "≈" : "")
+        let text =         ((certainty == .estimated || certainty == .panelSnapshot || certainty == .correlated) && showsKnownField ? "≈" : "")
             + (label.isEmpty ? "RateCue" : label)
         let title = NSMutableAttributedString(string: warning ? "⚠ " : "")
         let tint: NSColor? = switch certainty {
         case .verified where showsKnownField: .systemGreen
-        case .estimated where showsKnownField, .panelSnapshot where showsKnownField: .systemOrange
+        case .estimated where showsKnownField, .panelSnapshot where showsKnownField,
+             .correlated where showsKnownField: .systemOrange
         default: nil
         }
         title.append(NSAttributedString(string: text, attributes: tint.map { [.foregroundColor: $0] } ?? [:]))

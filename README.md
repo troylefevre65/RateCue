@@ -13,6 +13,8 @@
 | Amber `≈96k / 24` | A Music Lossless-panel snapshot explicitly showed 24-bit depth. It remains unverified and clears on playback, route, or reported-rate changes. |
 | Neutral `— / —` | No current source format is available. |
 
+Correlated bit depth is a separate amber estimate. It starts from provisional, uncalibrated rate-conditioned priors (44.1 kHz: 70% 16-bit / 30% 24-bit; 88.2/96/176.4 kHz: 30% / 70%; 192 kHz: 5% / 95%; otherwise 50% / 50%), then updates the candidate probabilities with bounded evidence likelihood weights. Music panel and Music log/decoder observations share one independence family, so only the strongest non-conflicting weight from that family is multiplied; duplicate influences remain visible with zero log-odds effect. Accepted observations persist only within the unchanged playback context. Prior-only formats retain their probabilities but always withhold an estimate. A candidate is published only when accepted evidence exists, its posterior is at least 90%, and no conflict exists. These provisional model outputs are not calibrated confidence claims, never qualify source format, and never trigger a device write.
+
 The menu's **Status** describes alignment using qualified evidence. It can say **Unknown Format** while an amber estimate is visible. Neither a device's configured rate nor a DAC LED establishes source bit depth. No display color proves bit-perfect playback.
 
 ## Build and run
@@ -47,6 +49,7 @@ ratecue=./dist/RateCue.app/Contents/MacOS/RateCue
 "$ratecue" --help
 "$ratecue" devices
 "$ratecue" status
+"$ratecue" menu-status
 "$ratecue" probe-format
 ```
 
@@ -56,7 +59,12 @@ ratecue=./dist/RateCue.app/Contents/MacOS/RateCue
 | `config show`, `config set ...` | Read or change RateCue preferences, not the system output route. The experimental panel option is set in the menu. |
 | `authorize-music` | Explicitly request Music Automation permission for the CLI launcher. Music must already be running. |
 | `status`, `check --rate <Hz> --depth <bits> [--device <uid-or-name>]` | Read a fresh qualified source and route observation. Amber menu estimates are not included. `check` returns 0 for a match, 1 for mismatch or unavailable evidence, and 2 for invalid invocation. |
+| `menu-status` | Read the running menu app's latest title, 16/24-bit posterior probabilities, evidence state, candidate, provenance, conflict/prior flags, and automatic-panel status from a local atomic JSON snapshot. It does not interact with Music or audio hardware. |
 | `probe-format [--panel\|--fresh-panel]` | Read unqualified Music evidence without changing playback or the device. `--panel` reads an open panel; `--fresh-panel` waits for the user to open it. |
+
+The `menu-status` payload is versioned and reproducible. It includes the schema/model versions, prior percentages, unrounded 24-bit posterior, and ordered contributions—including the rate prior—showing every influence, candidate, strength label, provisional likelihood ratio, and signed log-odds effect. Redundant same-family evidence is retained diagnostically with a zero effect. **Copy Diagnostics** renders the same complete contribution list rather than a summary-only subset.
+
+While Music is monitored, RateCue performs one bounded unified-log backfill per playback epoch. It reads current Music/Core Media decoder reports for sample rate and bit depth, with playback-position timing and reported-rate checks; failed reads stop after a retry budget. The parser is versioned and replay-tested, and accepted log evidence appears as `decoderLog` or `musicLog` with its actual contribution.
 | `playback <play\|pause\|next>` | Send a Music playback command. |
 | `--make-qualification-kit <new-folder>`, `--make-fixtures <new-folder>` | Generate synthetic audio files in a new directory. The qualification kit also compares each ALAC file with its PCM reference. |
 | `test-fixture --kit <folder> [--device <uid-or-name>] [--allow-interrupt]` | Play and check a known local fixture. It can alter Music's playback and queue but does not write the DAC rate. |

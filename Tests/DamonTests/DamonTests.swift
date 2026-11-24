@@ -26,6 +26,166 @@ struct DamonTests {
         #expect(Confidence.resolve(onlyHardware, epoch: epoch, since: 4, now: 6).format == Format())
     }
 
+    @Test func depthCorrelationRequiresFreshSamePlaybackEvidence() {
+        let context = DepthContext(epoch: epoch, trackID: "track", routeID: "device")
+        var engine = BitDepthCorrelationEngine(capacity: 4, freshness: 2)
+        engine.observe(.init(context: context, at: 10, source: .musicPanel, candidate: .bit16, strength: .strong))
+        engine.observe(.init(
+            context: .init(epoch: next, trackID: "track", routeID: "device"),
+            at: 10, source: .decoderLog, candidate: .bit24, strength: .strong
+        ))
+        let resolved = engine.resolve(context: context, rateHz: 44_100, now: 10.5)
+        #expect(resolved.candidate == .bit16)
+        #expect(resolved.score == 95)
+        #expect(resolved.posterior16 == 95)
+        #expect(resolved.posterior24 == 5)
+        #expect(!resolved.conflict)
+        #expect(!resolved.usedHighRatePrior)
+        #expect(resolved.provenance == [.musicPanel])
+        #expect(engine.resolve(context: context, rateHz: 44_100, now: 12.1).candidate == nil)
+    }
+
+    @Test func depthCorrelationUsesHighRateOnlyAsATieBreaker() {
+        let context = DepthContext(epoch: epoch, trackID: "track", routeID: "device")
+        var engine = BitDepthCorrelationEngine()
+        engine.observe(.init(context: context, at: 10, source: .musicPanel, candidate: .bit16, strength: .moderate))
+        engine.observe(.init(context: context, at: 10, source: .correlation, candidate: .bit24, strength: .moderate))
+        let lowRate = engine.resolve(context: context, rateHz: 48_000, now: 10.1)
+        #expect(lowRate.candidate == nil)
+        #expect(lowRate.conflict)
+        let highRate = engine.resolve(context: context, rateHz: 88_200, now: 10.1)
+        #expect(highRate.candidate == nil)
+        #expect(highRate.usedHighRatePrior)
+        #expect(highRate.conflict)
+        #expect(highRate.posterior16 == 30)
+        #expect(highRate.posterior24 == 70)
+    }
+
+    @Test func newerSameSourceDepthSupersedesOlderEvidence() {
+        let context = DepthContext(epoch: epoch, trackID: "track", routeID: "device")
+        var engine = BitDepthCorrelationEngine()
+        engine.observe(.init(
+            context: context, at: 10, source: .musicPanel, candidate: .bit24,
+            strength: .strong, persistsForContext: true
+        ))
+        engine.observe(.init(
+            context: context, at: 11, source: .musicPanel, candidate: .bit16,
+            strength: .strong, persistsForContext: true
+        ))
+        let result = engine.resolve(context: context, rateHz: 44_100, now: 20)
+        #expect(!result.conflict)
+        #expect(result.posterior16 == 95)
+        #expect(result.posterior24 == 5)
+        #expect(result.candidate == .bit16)
+
+        engine.observe(.init(
+            context: context, at: 10.5, source: .musicPanel, candidate: .bit24,
+            strength: .strong, persistsForContext: true
+        ))
+        let unchanged = engine.resolve(context: context, rateHz: 44_100, now: 20)
+        #expect(unchanged.posterior16 == 95)
+        #expect(unchanged.posterior24 == 5)
+    }
+
+    @Test func persistentPanelEvidenceSurvivesTransientCapacityPressure() {
+        let context = DepthContext(epoch: epoch, trackID: "track", routeID: "device")
+        var engine = BitDepthCorrelationEngine(capacity: 2, freshness: 1)
+        engine.observe(.init(
+            context: context, at: 10, source: .musicPanel, candidate: .bit24,
+            strength: .strong, persistsForContext: true
+        ))
+        engine.observe(.init(
+            context: context, at: 11, source: .musicLog, candidate: .bit24, strength: .weak
+        ))
+        engine.observe(.init(
+            context: context, at: 12, source: .decoderLog, candidate: .bit24, strength: .weak
+        ))
+        let result = engine.resolve(context: context, rateHz: 44_100, now: 20)
+        #expect(result.evidenceAvailable)
+        #expect(result.posterior24 > 50)
+        #expect(result.provenance.contains(.musicPanel))
+    }
+
+    @Test func explicitFresh16BitEvidenceBlocksTheHighRatePrior() {
+        let context = DepthContext(epoch: epoch, trackID: "track", routeID: "device")
+        var engine = BitDepthCorrelationEngine()
+        engine.observe(.init(context: context, at: 10, source: .musicPanel, candidate: .bit16, strength: .moderate))
+        engine.observe(.init(context: context, at: 10, source: .musicLog, candidate: .bit24, strength: .moderate))
+        let result = engine.resolve(context: context, rateHz: 96_000, now: 10.1)
+        #expect(result.candidate == nil)
+        #expect(result.usedHighRatePrior)
+        #expect(result.conflict)
+        #expect(result.contributions.filter { $0.logOddsContribution != 0 && $0.source != "ratePrior" }.map(\.source) == ["musicLog"])
+    }
+
+    @Test func highRatePriorNeverOverturnsA16BitEvidenceLead() {
+        let context = DepthContext(epoch: epoch, trackID: "track", routeID: "device")
+        var engine = BitDepthCorrelationEngine()
+        engine.observe(.init(context: context, at: 10, source: .musicLog, candidate: .bit16, strength: .strong))
+        engine.observe(.init(context: context, at: 10, source: .decoderLog, candidate: .bit16, strength: .strong))
+        engine.observe(.init(context: context, at: 10, source: .localHeader, candidate: .bit16, strength: .strong))
+        engine.observe(.init(context: context, at: 10, source: .musicLog, candidate: .bit24, strength: .moderate))
+        let result = engine.resolve(context: context, rateHz: 96_000, now: 10.1)
+        #expect(result.candidate == nil)
+        #expect(result.usedHighRatePrior)
+        #expect(result.posterior16 > result.posterior24)
+        #expect(result.conflict)
+    }
+
+    @Test func depthCorrelationPrefersIndependentCorroborationAndBoundsCapacity() {
+        let context = DepthContext(epoch: epoch, trackID: "track", routeID: "device")
+        var engine = BitDepthCorrelationEngine(capacity: 2)
+        engine.observe(.init(context: context, at: 10, source: .musicPanel, candidate: .bit16, strength: .weak))
+        engine.observe(.init(context: context, at: 10.1, source: .musicLog, candidate: .bit24, strength: .strong))
+        engine.observe(.init(context: context, at: 10.2, source: .decoderLog, candidate: .bit24, strength: .strong))
+        let result = engine.resolve(context: context, rateHz: 44_100, now: 10.3)
+        #expect(result.candidate == nil)
+        #expect(result.score == 79)
+        #expect(result.provenance == [.decoderLog, .musicLog])
+        #expect(result.contributions.filter { $0.source != "ratePrior" && $0.logOddsContribution != 0 }.count == 1)
+        #expect(result.contributions.filter { $0.source != "ratePrior" && $0.logOddsContribution == 0 }.count == 1)
+    }
+
+    @Test func depthCorrelationReturnsRatePriorsWithoutEvidence() {
+        let context = DepthContext(epoch: epoch, trackID: "track", routeID: "device")
+        let engine = BitDepthCorrelationEngine()
+        let redBook = engine.resolve(context: context, rateHz: 44_100, now: 10)
+        #expect(redBook.posterior16 == 70)
+        #expect(redBook.posterior24 == 30)
+        #expect(!redBook.evidenceAvailable)
+        #expect(redBook.candidate == nil)
+        let highResolution = engine.resolve(context: context, rateHz: 96_000, now: 10)
+        #expect(highResolution.posterior16 == 30)
+        #expect(highResolution.posterior24 == 70)
+        #expect(!highResolution.evidenceAvailable)
+        let extremeHighResolution = engine.resolve(context: context, rateHz: 192_000, now: 10)
+        #expect(extremeHighResolution.posterior16 == 5)
+        #expect(extremeHighResolution.posterior24 == 95)
+        #expect(extremeHighResolution.candidate == nil)
+        #expect(!extremeHighResolution.evidenceAvailable)
+        let unknownRate = engine.resolve(context: context, rateHz: nil, now: 10)
+        #expect(unknownRate.posterior16 == 50)
+        #expect(unknownRate.posterior24 == 50)
+    }
+
+    @Test func acceptedPanelEvidencePersistsOnlyWithinItsPlaybackContext() {
+        let context = DepthContext(epoch: epoch, trackID: "track", routeID: "device")
+        var engine = BitDepthCorrelationEngine(freshness: 1)
+        engine.observe(.init(
+            context: context, at: 10, source: .musicPanel, candidate: .bit24,
+            strength: .strong, persistsForContext: true
+        ))
+        let retained = engine.resolve(context: context, rateHz: 44_100, now: 20)
+        #expect(retained.evidenceAvailable)
+        #expect(retained.posterior24 == 79)
+        #expect(retained.posterior16 == 21)
+        let nextContext = DepthContext(epoch: next, trackID: "track", routeID: "device")
+        let invalidated = engine.resolve(context: nextContext, rateHz: 44_100, now: 20)
+        #expect(!invalidated.evidenceAvailable)
+        #expect(invalidated.posterior16 == 70)
+        #expect(invalidated.posterior24 == 30)
+    }
+
     @Test func sameTierConflictNeverFallsBack() {
         let evidence = [
             Evidence(epoch: epoch, source: .sourceStream, at: 5, format: Format(rate: 96_000, depth: 24)),
@@ -183,6 +343,17 @@ struct DamonTests {
     }
 
     @MainActor
+    @Test func menuDisplaysCorrelatedDepthAsASeparateEstimate() {
+        let playback = Playback(state: .playing, trackID: "catalog", position: nil, file: nil, reportedRate: 96_000)
+        let estimate = DepthResolution(
+            candidate: .bit24, score: 70, conflict: false, usedHighRatePrior: true, provenance: []
+        )
+        let display = FormatDisplay(verified: Format(), playback: playback, depthEstimate: estimate)
+        #expect(display.certainty == .correlated)
+        #expect(display.statusBarTitle(showRate: true, showDepth: true, warning: false).string == "≈96k / 24")
+    }
+
+    @MainActor
     @Test func menuPrefersVerifiedFormatAndClearsTheColorWhenPlaybackStops() {
         let verified = Format(rate: 44_100, depth: 16)
         let playback = Playback(state: .playing, trackID: "local", position: nil, file: nil, reportedRate: 96_000)
@@ -249,6 +420,71 @@ struct DamonTests {
         #expect(try store.read().autoReadMusicPanel)
         try store.apply([.autoReadMusicPanel(false)])
         #expect(try !store.read().autoReadMusicPanel)
+    }
+
+    @Test func menuDiagnosticsStoreRoundTripsCorrelationState() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let snapshot = MenuDiagnosticsSnapshot(
+            snapshotAt: Date(timeIntervalSince1970: 1_800_000_000),
+            processIdentifier: 123,
+            menuTitle: "≈44.1k / 16",
+            certainty: "Music panel snapshot, unverified",
+            correlationScore: 95,
+            correlatedDepth: 16,
+            correlationConflict: false,
+            usedHighRatePrior: false,
+            correlationProvenance: ["musicPanel"],
+            playbackState: "playing",
+            automaticPanelStatus: "Unverified Music panel snapshot.",
+            posterior16: 95,
+            posterior24: 5,
+            evidenceAvailable: true,
+            contributions: [
+                .init(
+                    source: "ratePrior", candidate: 16, strength: "prior",
+                    likelihoodRatio: 0.428571, logOddsContribution: -0.847297
+                ),
+                .init(
+                    source: "musicPanel", candidate: 16, strength: "strong",
+                    likelihoodRatio: 9, logOddsContribution: -2.197225
+                )
+            ]
+        )
+        let store = MenuDiagnosticsStore(directory: directory)
+        try store.write(snapshot)
+        #expect(try store.read() == snapshot)
+        let data = try Data(contentsOf: store.url)
+        let json = try #require(String(data: data, encoding: .utf8))
+        #expect(json.contains("\"posterior16\" : 95"))
+        #expect(json.contains("\"correlationProvenance\" : ["))
+        #expect(json.contains("\"schemaVersion\" : 1"))
+        #expect(json.contains("\"correlationModelVersion\" : 1"))
+        #expect(json.contains("\"snapshotAt\" : \"2027-"))
+        #expect(!json.contains("trackID"))
+    }
+
+    @Test func menuDiagnosticsRejectStaleOrReplacedProcesses() {
+        let now = Date(timeIntervalSince1970: 1_800_000_100)
+        func snapshot(_ at: TimeInterval, pid: Int32 = 123) -> MenuDiagnosticsSnapshot {
+            MenuDiagnosticsSnapshot(
+                snapshotAt: Date(timeIntervalSince1970: at),
+                processIdentifier: pid,
+                menuTitle: "≈44.1k / 16",
+                certainty: "Music panel snapshot, unverified",
+                correlationScore: 100,
+                correlatedDepth: 16,
+                correlationConflict: false,
+                usedHighRatePrior: false,
+                correlationProvenance: ["musicPanel"],
+                playbackState: "playing",
+                automaticPanelStatus: "Unverified Music panel snapshot."
+            )
+        }
+        #expect(DamonCLI.validMenuSnapshot(snapshot(1_800_000_096), now: now) { $0 == 123 })
+        #expect(!DamonCLI.validMenuSnapshot(snapshot(1_800_000_090), now: now) { $0 == 123 })
+        #expect(!DamonCLI.validMenuSnapshot(snapshot(1_800_000_102), now: now) { $0 == 123 })
+        #expect(!DamonCLI.validMenuSnapshot(snapshot(1_800_000_099), now: now) { _ in false })
     }
 
     @Test func monitoringOrPanelSettingChangesInvalidateAutomaticReads() {

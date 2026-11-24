@@ -45,6 +45,18 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var previousMusicPID: pid_t?
     private var currentFormat = Format()
     private var panelSnapshot: PanelFormatSnapshot?
+    private var depthCorrelation = BitDepthCorrelationEngine()
+    private var logEvidenceTask: Task<Void, Never>?
+    private var lastLogEvidenceProbeAt = 0.0
+    private var logEvidenceBackfilledEpoch: Epoch?
+    private var logEvidenceFailures = 0
+    private var logEvidenceAttempts = 0
+    private var logEvidenceStatus = "Not attempted"
+    private let menuDiagnostics = MenuDiagnosticsStore()
+    private var lastMenuDiagnosticsAt = 0.0
+    private var lastMenuDiagnosticsSignature: String?
+    private var lastMenuDiagnosticsWriteAt = 0.0
+    private var menuDiagnosticsError: String?
     private var panelTask: Task<Void, Never>?
     private var panelPrompt: String?
     private var automaticPanelTask: Task<Void, Never>?
@@ -78,6 +90,7 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 appendLog("Hardware verification profiles could not be read: \(error.localizedDescription)")
             }
         }
+
         menu.delegate = self
         item.menu = menu
         activationObserver = NSWorkspace.shared.notificationCenter.addObserver(
@@ -105,12 +118,83 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refresh?.cancel()
         panelTask?.cancel()
         automaticPanelTask?.cancel()
+        logEvidenceTask?.cancel()
         if let activationObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(activationObserver)
         }
         audioRefresh.stop()
         audioChanges.stop()
         verifier.stop()
+    }
+
+    private func scheduleLogEvidenceRead() {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard logEvidenceTask == nil, now - lastLogEvidenceProbeAt >= 3,
+              logEvidenceBackfilledEpoch != epoch, logEvidenceAttempts < 5,
+              automation, let pid = previousMusicPID,
+              let playback = previous?.playback, playback.state == .playing,
+              let trackID = playback.trackID, let reportedRate = playback.reportedRate else { return }
+        guard let context = depthContext(for: previous) else { return }
+        let selectedEpoch = epoch
+        let elapsed = max(0, playback.position ?? now - playbackBoundary)
+        let estimatedStart = Date().addingTimeInterval(-elapsed)
+        lastLogEvidenceProbeAt = now
+        logEvidenceAttempts += 1
+        logEvidenceTask = Task { [weak self] in
+            let outcome = await Task.detached {
+                Result { try MusicLogEvidenceReader.collect(around: estimatedStart, radius: 30) }
+            }.value
+            guard let self else { return }
+            self.logEvidenceTask = nil
+            defer { self.audioRefresh.signal() }
+            guard !Task.isCancelled, self.epoch == selectedEpoch, self.previousMusicPID == pid,
+                  self.previous?.playback?.trackID == trackID,
+                  self.previous?.playback?.state == .playing else { return }
+            switch outcome {
+            case let .success(events):
+                self.logEvidenceFailures = 0
+                let eligible = events.filter { event in
+                    guard event.source == .decoder, let start = event.playbackStartAt else { return false }
+                    return abs(start.timeIntervalSince(estimatedStart)) <= 15
+                        && event.rate == reportedRate && [16, 24].contains(event.depth)
+                }
+                let event = eligible.min {
+                    let left = $0.playbackStartAt.map { abs($0.timeIntervalSince(estimatedStart)) } ?? .greatestFiniteMagnitude
+                    let right = $1.playbackStartAt.map { abs($0.timeIntervalSince(estimatedStart)) } ?? .greatestFiniteMagnitude
+                    return left < right
+                }
+                if let event, let candidate = DepthCandidate(rawValue: event.depth) {
+                    self.logEvidenceBackfilledEpoch = selectedEpoch
+                    let source: DepthEvidenceSource = event.source == .decoder ? .decoderLog : .musicLog
+                    let strength: DepthEvidenceStrength = event.source == .decoder ? .direct : .moderate
+                    self.depthCorrelation.observe(
+                        DepthObservation(
+                            context: context, at: ProcessInfo.processInfo.systemUptime,
+                            source: source, candidate: candidate, strength: strength,
+                            persistsForContext: true
+                        )
+                    )
+                    self.logEvidenceStatus =
+                        "\(event.source.rawValue) \(event.rate) Hz / \(event.depth)-bit at "
+                        + event.at.formatted(date: .omitted, time: .standard)
+                } else {
+                    self.logEvidenceStatus = "No current rate-consistent decoder format event in backfill."
+                    if self.logEvidenceAttempts >= 5 {
+                        self.logEvidenceBackfilledEpoch = selectedEpoch
+                    }
+                }
+                self.updateButton()
+            case let .failure(error):
+                self.logEvidenceFailures += 1
+                self.lastLogEvidenceProbeAt = ProcessInfo.processInfo.systemUptime + (self.logEvidenceFailures == 1 ? 12 : 57)
+                let message = "Music log read failed: \(error.localizedDescription)"
+                self.logEvidenceStatus = message
+                self.appendLog(message)
+                if self.logEvidenceAttempts >= 5 {
+                    self.logEvidenceBackfilledEpoch = selectedEpoch
+                }
+            }
+        }
     }
 
     private func tick() async {
@@ -129,7 +213,9 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             old - new > 0.5 && new >= 0 && new < 1
         } else { false }
         let playbackChanged = previous?.playback?.trackID != sample.playback?.trackID
-            || previous?.playback?.state != sample.playback?.state || previousMusicPID != pid || formatChanged || repeatOrSeek
+            || previous?.playback?.state != sample.playback?.state
+            || previous?.playback?.reportedRate != sample.playback?.reportedRate
+            || previousMusicPID != pid || formatChanged || repeatOrSeek
         if previous?.playback?.reportedRate != sample.playback?.reportedRate {
             automaticPanelTask?.cancel()
             automaticPanelAttemptEpoch = nil
@@ -151,6 +237,10 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             } else { false }
             playbackBoundary = sample.at
             epoch = Epoch(playback: epoch.playback + (playbackChanged ? 1 : 0), route: epoch.route + (routeChanged ? 1 : 0))
+            logEvidenceBackfilledEpoch = nil
+            logEvidenceFailures = 0
+            logEvidenceAttempts = 0
+            logEvidenceStatus = "Waiting for current-track decoder evidence…"
         }
         appliedPreferenceGeneration = generation
         previous = sample
@@ -222,6 +312,7 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             lastMessage = message
         }
         scheduleAutomaticPanelRead()
+        scheduleLogEvidenceRead()
         updateButton()
     }
 
@@ -282,7 +373,29 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func formatDisplay() -> FormatDisplay {
-        FormatDisplay(verified: currentFormat, playback: previous?.playback, panel: panelSnapshot, epoch: epoch)
+        return FormatDisplay(
+            verified: currentFormat, playback: previous?.playback, panel: panelSnapshot, epoch: epoch,
+            depthEstimate: depthResolution(for: previous)
+        )
+    }
+
+    private func depthResolution(for sample: PlaybackSample?) -> DepthResolution? {
+        guard let context = depthContext(for: sample) else { return nil }
+        let now = ProcessInfo.processInfo.systemUptime
+        let correlated = depthCorrelation.resolve(
+            context: context, rateHz: sample?.playback?.reportedRate, now: now
+        )
+        return correlated
+    }
+
+    private func depthContext(for sample: PlaybackSample?) -> DepthContext? {
+        guard let trackID = sample?.playback?.trackID else { return nil }
+        let routeID = sample?.route?.map(String.init).joined(separator: ",")
+            ?? sample?.preferredOutput(uid: preferredUID)?.endpoint
+            ?? previousDevice?.endpoint
+            ?? "unconfirmed"
+        guard !routeID.isEmpty else { return nil }
+        return DepthContext(epoch: epoch, trackID: trackID, routeID: routeID)
     }
 
     private func updateButton() {
@@ -296,8 +409,76 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             display.statusBarTitle(showRate: showRate, showDepth: showDepth, warning: warning)
         }
         if !button.attributedTitle.isEqual(to: title) { button.attributedTitle = title }
-        button.toolTip = "\(display.certainty.rawValue) • \(status(sample: previous))"
+        let correlation = depthResolution(for: previous).map {
+            " • Bit-depth: 16-bit \($0.posterior16)% / 24-bit \($0.posterior24)%"
+        } ?? ""
+        button.toolTip = "\(display.certainty.rawValue) • \(status(sample: previous))\(correlation)"
         button.setAccessibilityLabel("RateCue: \(title.string). \(display.certainty.rawValue).")
+        publishMenuDiagnostics(display: display, title: title.string)
+    }
+
+    private func publishMenuDiagnostics(display: FormatDisplay, title: String) {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now - lastMenuDiagnosticsAt >= 0.25 else { return }
+        lastMenuDiagnosticsAt = now
+        let resolution = depthResolution(for: previous)
+        let snapshot = MenuDiagnosticsSnapshot(
+            snapshotAt: Date(),
+            processIdentifier: ProcessInfo.processInfo.processIdentifier,
+            menuTitle: title,
+            certainty: display.certainty.rawValue,
+            correlationScore: resolution?.score ?? 0,
+            correlatedDepth: resolution?.candidate?.rawValue,
+            correlationConflict: resolution?.conflict ?? false,
+            usedHighRatePrior: resolution?.usedHighRatePrior ?? false,
+            correlationProvenance: resolution?.provenance.map(\.rawValue) ?? [],
+            playbackState: previous?.playback?.state.rawValue,
+            automaticPanelStatus: automaticPanelStatus,
+            logEvidenceStatus: logEvidenceStatus,
+            mostLikelyDepth: (resolution?.posterior24 ?? 50) > (resolution?.posterior16 ?? 50) ? 24 : 16,
+            publicationStatus: {
+                guard let resolution else { return "noContext" }
+                if resolution.candidate != nil { return "published" }
+                if resolution.conflict { return "withheldForConflict" }
+                if !resolution.evidenceAvailable { return "priorOnly" }
+                return "belowNinetyPercentThreshold"
+            }(),
+            posterior16: resolution?.posterior16 ?? 50,
+            posterior24: resolution?.posterior24 ?? 50,
+            evidenceAvailable: resolution?.evidenceAvailable ?? false,
+            correlationModelVersion: resolution?.modelVersion ?? 1,
+            prior16: resolution?.prior16 ?? 50,
+            prior24: resolution?.prior24 ?? 50,
+            unroundedProbability24: resolution?.unroundedProbability24 ?? 0.5,
+            contributions: resolution?.contributions.map {
+                MenuDiagnosticsSnapshot.Contribution(
+                    source: $0.source,
+                    candidate: $0.candidate?.rawValue,
+                    strength: $0.strength,
+                    likelihoodRatio: $0.likelihoodRatio,
+                    logOddsContribution: $0.logOddsContribution
+                )
+            } ?? []
+        )
+        let signature = "\(snapshot.menuTitle)|\(snapshot.certainty)|\(snapshot.posterior16)|\(snapshot.posterior24)|"
+            + "\(snapshot.evidenceAvailable)|\(snapshot.correlationConflict)|\(snapshot.publicationStatus)|"
+            + "\(snapshot.correlationProvenance.joined(separator: ","))|"
+            + "\(snapshot.automaticPanelStatus ?? "")|\(snapshot.logEvidenceStatus)|"
+            + "\(snapshot.playbackState ?? "")|"
+            + "\(snapshot.contributions.map { "\($0.source):\($0.candidate ?? 0):\($0.logOddsContribution)" }.joined(separator: ","))"
+        guard signature != lastMenuDiagnosticsSignature || now - lastMenuDiagnosticsWriteAt >= 2 else { return }
+        do {
+            try menuDiagnostics.write(snapshot)
+            lastMenuDiagnosticsSignature = signature
+            lastMenuDiagnosticsWriteAt = now
+            menuDiagnosticsError = nil
+        } catch {
+            let message = error.localizedDescription
+            if menuDiagnosticsError != message {
+                appendLog("Could not publish menu diagnostics: \(message)")
+                menuDiagnosticsError = message
+            }
+        }
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
@@ -310,11 +491,34 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let active = sample?.activeOutputs ?? []
         append("Active Output: " + (active.isEmpty ? "Unconfirmed" : active.map(\.name).joined(separator: ", ")))
         let trackRate = display.format.rate.map {
-            ((display.certainty == .estimated || display.certainty == .panelSnapshot) ? "≈" : "") + "\($0) Hz"
+            ([.estimated, .panelSnapshot, .correlated].contains(display.certainty) ? "≈" : "") + "\($0) Hz"
         } ?? "—"
         let trackDepth = display.format.depth.map { "\($0)-bit" } ?? "—"
         append("Track Format: \(trackRate) / \(trackDepth)")
         append("Confidence: \(display.certainty.rawValue)")
+        if let resolution = depthResolution(for: sample) {
+            let candidate = resolution.candidate.map { "\($0.rawValue)-bit" } ?? "unknown"
+            let provenance = resolution.provenance.map(\.rawValue).joined(separator: ", ")
+            let sources = provenance.isEmpty ? "no contributing observations" : provenance
+            let prior = resolution.usedHighRatePrior ? "; high-rate prior" : ""
+            append("Bit-depth: 16-bit \(resolution.posterior16)% / 24-bit \(resolution.posterior24)%")
+            append(
+                "Correlation: \(resolution.evidenceAvailable ? "evidence" : "prior only")"
+                    + " (\(candidate); \(sources)\(prior))"
+            )
+            append("Depth prior: 16-bit \(resolution.prior16)% / 24-bit \(resolution.prior24)%")
+            for contribution in resolution.contributions {
+                let candidate = contribution.candidate.map { "\($0.rawValue)-bit" } ?? "unknown"
+                let ratio = contribution.likelihoodRatio.map { String(format: "%.2fx", $0) } ?? "—"
+                let odds = String(format: "%+.3f", contribution.logOddsContribution)
+                append(
+                    "Influence: \(contribution.source) → \(candidate), "
+                        + "\(contribution.strength), LR \(ratio), log-odds \(odds)"
+                )
+            }
+        } else {
+            append("Bit-depth: 50% / 50% (no current playback context)")
+        }
         if settings.autoReadMusicPanel, let automaticPanelStatus {
             append("Automatic depth: \(automaticPanelStatus)")
         }
@@ -492,11 +696,30 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         alert("RateCue session diagnostics", detail: logs.isEmpty ? "No events yet." : logs.suffix(16).joined(separator: "\n"))
     }
 
+    private func depthDiagnosticText() -> String {
+        guard let resolution = depthResolution(for: previous) else { return "unavailable" }
+        let contributions = resolution.contributions.map { contribution in
+            let candidate = contribution.candidate.map { "\($0.rawValue)-bit" } ?? "unknown"
+            let ratio = contribution.likelihoodRatio.map { String(format: "%.2fx", $0) } ?? "—"
+            let odds = String(format: "%+.3f", contribution.logOddsContribution)
+            return "\(contribution.source): \(candidate), \(contribution.strength), LR \(ratio), log-odds \(odds)"
+        }.joined(separator: "; ")
+        let mostLikely = resolution.posterior16 == resolution.posterior24
+            ? "tied"
+            : resolution.posterior16 > resolution.posterior24 ? "16-bit" : "24-bit"
+        let candidate = resolution.candidate.map { "\($0.rawValue)-bit" } ?? "withheld at 90% threshold"
+        return "16-bit \(resolution.posterior16)% / 24-bit \(resolution.posterior24)%; "
+            + "model \(resolution.modelVersion); most likely \(mostLikely); candidate \(candidate); "
+            + "conflict \(resolution.conflict); evidence available \(resolution.evidenceAvailable); "
+            + "prior \(resolution.prior16)/\(resolution.prior24); contributions: \(contributions)"
+    }
+
     @objc private func copyDiagnostics() {
         let display = formatDisplay()
         let text = """
             Track format: \(display.statusBarTitle(showRate: true, showDepth: true, warning: false).string)
             Confidence: \(display.certainty.rawValue)
+            Bit-depth posterior: \(depthDiagnosticText())
             Music monitoring: \(automation ? "on" : "off")
             Accessibility access: \(MusicFormatPanel.hasAccessibilityAccess ? "enabled" : "not enabled")
             Automatic panel reading: \(settings.autoReadMusicPanel ? "on" : "off")
@@ -779,6 +1002,14 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         panelSnapshot = PanelFormatSnapshot(format: Format(rate: reading.rate, depth: depth), epoch: selectedEpoch, trackID: trackID)
         if automatic { automaticPanelStatus = "Unverified Music panel snapshot." }
+        if let context = depthContext(for: previous), let candidate = DepthCandidate(rawValue: reading.bitDepth ?? 0) {
+            depthCorrelation.observe(
+                DepthObservation(
+                    context: context, at: ProcessInfo.processInfo.systemUptime, source: .musicPanel,
+                    candidate: candidate, strength: .moderate, persistsForContext: true
+                )
+            )
+        }
         updateButton()
         return true
     }

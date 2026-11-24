@@ -78,6 +78,252 @@ public enum Confidence {
     }
 }
 
+public struct DepthContext: Equatable, Sendable {
+    public let epoch: Epoch
+    public let trackID: String
+    public let routeID: String
+
+    public init(epoch: Epoch, trackID: String, routeID: String) {
+        self.epoch = epoch
+        self.trackID = trackID
+        self.routeID = routeID
+    }
+}
+
+public enum DepthCandidate: Int, Equatable, Hashable, Sendable, CaseIterable {
+    case bit16 = 16
+    case bit24 = 24
+}
+
+public enum DepthEvidenceSource: String, Equatable, Hashable, Sendable {
+    case correlation
+    case localHeader
+    case musicPanel
+    case musicLog
+    case decoderLog
+
+    fileprivate var independenceFamily: String {
+        switch self {
+        case .musicPanel, .musicLog, .decoderLog: "music"
+        case .localHeader: "localAsset"
+        case .correlation: "correlation"
+        }
+    }
+}
+
+public enum DepthEvidenceStrength: Int, Sendable {
+    case weak = 2
+    case moderate = 4
+    case strong = 9
+    case direct = 36
+}
+
+public struct DepthContribution: Equatable, Sendable {
+    public let source: String
+    public let candidate: DepthCandidate?
+    public let strength: String
+    public let likelihoodRatio: Double?
+    public let logOddsContribution: Double
+
+    public init(
+        source: String, candidate: DepthCandidate?, strength: String,
+        likelihoodRatio: Double?, logOddsContribution: Double
+    ) {
+        self.source = source
+        self.candidate = candidate
+        self.strength = strength
+        self.likelihoodRatio = likelihoodRatio
+        self.logOddsContribution = logOddsContribution
+    }
+}
+
+public struct DepthObservation: Sendable {
+    public let context: DepthContext
+    public let at: TimeInterval
+    public let source: DepthEvidenceSource
+    public let candidate: DepthCandidate
+    public let strength: DepthEvidenceStrength
+    public let persistsForContext: Bool
+
+    public init(
+        context: DepthContext, at: TimeInterval, source: DepthEvidenceSource,
+        candidate: DepthCandidate, strength: DepthEvidenceStrength, persistsForContext: Bool = false
+    ) {
+        self.context = context
+        self.at = at
+        self.source = source
+        self.candidate = candidate
+        self.strength = strength
+        self.persistsForContext = persistsForContext
+    }
+}
+
+public struct DepthResolution: Equatable, Sendable {
+    public let candidate: DepthCandidate?
+    public let score: Int
+    public let posterior16: Int
+    public let posterior24: Int
+    public let evidenceAvailable: Bool
+    public let conflict: Bool
+    public let usedHighRatePrior: Bool
+    public let provenance: [DepthEvidenceSource]
+    public let modelVersion: Int
+    public let prior16: Int
+    public let prior24: Int
+    public let unroundedProbability24: Double
+    public let contributions: [DepthContribution]
+
+    public init(
+        candidate: DepthCandidate?, score: Int, conflict: Bool,
+        usedHighRatePrior: Bool, provenance: [DepthEvidenceSource],
+        posterior16: Int = 50, posterior24: Int = 50, evidenceAvailable: Bool = false,
+        modelVersion: Int = 1, prior16: Int = 50, prior24: Int = 50,
+        unroundedProbability24: Double = 0.5, contributions: [DepthContribution] = []
+    ) {
+        self.candidate = candidate
+        self.score = score
+        self.posterior16 = posterior16
+        self.posterior24 = posterior24
+        self.evidenceAvailable = evidenceAvailable
+        self.conflict = conflict
+        self.usedHighRatePrior = usedHighRatePrior
+        self.provenance = provenance
+        self.modelVersion = modelVersion
+        self.prior16 = prior16
+        self.prior24 = prior24
+        self.unroundedProbability24 = unroundedProbability24
+        self.contributions = contributions
+    }
+}
+
+public struct BitDepthCorrelationEngine: Sendable {
+    public let capacity: Int
+    public let freshness: TimeInterval
+    private var observations: [DepthObservation] = []
+
+    public init(capacity: Int = 16, freshness: TimeInterval = 2) {
+        self.capacity = max(1, capacity)
+        self.freshness = max(0.1, freshness)
+    }
+
+    public mutating func observe(_ observation: DepthObservation) {
+        guard !observation.context.trackID.isEmpty,
+              !observation.context.routeID.isEmpty,
+              observation.at.isFinite else { return }
+        if let latest = observations.filter({
+            $0.context == observation.context && $0.source == observation.source
+        }).map(\.at).max(), latest > observation.at {
+            return
+        }
+        if observation.persistsForContext {
+            observations.removeAll { $0.context != observation.context }
+        }
+        observations.removeAll { $0.context == observation.context && $0.source == observation.source }
+        observations.append(observation)
+        if observations.count > capacity {
+            var excess = observations.count - capacity
+            observations = observations.filter { item in
+                guard excess > 0, !item.persistsForContext else { return true }
+                excess -= 1
+                return false
+            }
+        }
+    }
+
+    public func resolve(context: DepthContext, rateHz: Int?, now: TimeInterval) -> DepthResolution {
+        guard now.isFinite else {
+            return DepthResolution(
+                candidate: nil, score: 50, conflict: false, usedHighRatePrior: false, provenance: []
+            )
+        }
+        let current = observations.filter {
+            $0.context == context && $0.at <= now
+                && ($0.persistsForContext || $0.at >= now - freshness)
+        }
+        let prior = switch rateHz {
+        case 44_100: 70
+        case 88_200, 96_000, 176_400: 30
+        case 192_000: 5
+        default: 50
+        }
+        let usedHighRatePrior = prior < 50
+        var logOdds24 = log(Double(100 - prior) / Double(prior))
+        var contributions = [DepthContribution(
+            source: "ratePrior",
+            candidate: prior == 50 ? nil : prior == 70 ? .bit16 : .bit24,
+            strength: "prior",
+            likelihoodRatio: Double(100 - prior) / Double(prior),
+            logOddsContribution: logOdds24
+        )]
+        var sources: [DepthCandidate: [DepthEvidenceSource: DepthEvidenceStrength]] = [.bit16: [:], .bit24: [:]]
+        for observation in current {
+            var candidateSources = sources[observation.candidate] ?? [:]
+            if let existing = candidateSources[observation.source] {
+                candidateSources[observation.source] = DepthEvidenceStrength(
+                    rawValue: max(existing.rawValue, observation.strength.rawValue)
+                )
+            } else {
+                candidateSources[observation.source] = observation.strength
+            }
+            sources[observation.candidate] = candidateSources
+        }
+        let flattenedSources = DepthCandidate.allCases.flatMap { candidate in
+            (sources[candidate] ?? [:]).map { (candidate, $0.key, $0.value) }
+        }
+        let strongestByFamily = Dictionary(grouping: flattenedSources, by: { $0.1.independenceFamily })
+            .compactMapValues {
+                $0.max { lhs, rhs in
+                    if lhs.2.rawValue == rhs.2.rawValue {
+                        return lhs.1.rawValue > rhs.1.rawValue
+                    }
+                    return lhs.2.rawValue < rhs.2.rawValue
+                }
+            }
+        for candidate in DepthCandidate.allCases {
+            let candidateSources = (sources[candidate] ?? [:]).sorted(by: { $0.key.rawValue < $1.key.rawValue })
+            for (source, strength) in candidateSources {
+                let ratio = Double(strength.rawValue)
+                let strongest = strongestByFamily[source.independenceFamily]
+                let selected = strongest?.0 == candidate && strongest?.1 == source
+                let contribution = selected ? log(ratio) * (candidate == .bit24 ? 1 : -1) : 0
+                if selected {
+                    logOdds24 += contribution
+                }
+                contributions.append(DepthContribution(
+                    source: source.rawValue, candidate: candidate, strength: String(describing: strength),
+                    likelihoodRatio: ratio, logOddsContribution: contribution
+                ))
+            }
+        }
+        let probability24 = 1 / (1 + exp(-logOdds24))
+        let posterior24 = max(0, min(100, Int((probability24 * 100).rounded())))
+        let posterior16 = 100 - posterior24
+        let evidenceAvailable = !current.isEmpty
+        let conflict = (sources[.bit16]?.isEmpty == false) && (sources[.bit24]?.isEmpty == false)
+        let canPublish = evidenceAvailable && !conflict
+        let candidate: DepthCandidate? = if canPublish, probability24 >= 0.9 {
+            .bit24
+        } else if canPublish, (1 - probability24) >= 0.9 {
+            .bit16
+        } else {
+            nil
+        }
+        let provenance = Array(Set(
+            DepthCandidate.allCases.flatMap { candidate in
+                sources[candidate]?.keys.map { $0 } ?? []
+            }
+        )).sorted { $0.rawValue < $1.rawValue }
+        return DepthResolution(
+            candidate: candidate,
+            score: candidate == .bit16 ? posterior16 : candidate == .bit24 ? posterior24 : max(posterior16, posterior24),
+            conflict: conflict, usedHighRatePrior: usedHighRatePrior, provenance: provenance,
+            posterior16: posterior16, posterior24: posterior24, evidenceAvailable: evidenceAvailable,
+            modelVersion: 2, prior16: prior, prior24: 100 - prior,
+            unroundedProbability24: probability24, contributions: contributions
+        )
+    }
+}
+
 public struct AlignmentInput: Sendable {
     public let epoch: Epoch
     public let playbackBoundary: TimeInterval

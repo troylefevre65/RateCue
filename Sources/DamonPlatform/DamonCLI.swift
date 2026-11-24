@@ -18,6 +18,8 @@ public enum DamonCLI {
         --show-depth <on|off>
       authorize-music                              Request Music Automation access explicitly.
       status                                       Read a fresh Music and device snapshot as JSON.
+      menu-status                                  Read the running menu app's latest diagnostics.
+      log-format                                   Read current Music format events from unified logs.
       probe-format [--panel|--fresh-panel]         Read unqualified Music format evidence without switching.
       playback <play|pause|next>                   Send one playback command to the running Music app.
       check --rate <Hz> --depth <bits> [options]    Check the current source format and Music output.
@@ -140,6 +142,19 @@ public enum DamonCLI {
                 try requireArgumentCount(args, 1)
                 let settings = try store.read()
                 try printJSON(Observation(sample: observe(settings), settings: settings))
+            case "menu-status":
+                try requireArgumentCount(args, 1)
+                let snapshot = try MenuDiagnosticsStore().read()
+                guard snapshot.schemaVersion == 1 else {
+                    throw CommandError("Unsupported menu diagnostics schema \(snapshot.schemaVersion).", exitCode: 1)
+                }
+                guard validMenuSnapshot(snapshot, now: Date()) else {
+                    throw CommandError("Menu diagnostics are stale or no longer belong to a running RateCue app.", exitCode: 1)
+                }
+                try printJSON(snapshot, dateEncodingStrategy: .iso8601)
+            case "log-format":
+                try requireArgumentCount(args, 1)
+                try printJSON(MusicLogEvidenceReader.collect(last: 900), dateEncodingStrategy: .iso8601)
             case "probe-format":
                 let options = try parseOptions(Array(args.dropFirst()), allowed: [], flags: ["--panel", "--fresh-panel"])
                 guard options["--panel"] == nil || options["--fresh-panel"] == nil else {
@@ -200,6 +215,16 @@ public enum DamonCLI {
     @MainActor
     private static var musicPID: pid_t? {
         NSRunningApplication.runningApplications(withBundleIdentifier: PlaybackSample.musicBundleID).first?.processIdentifier
+    }
+
+    static func validMenuSnapshot(
+        _ snapshot: MenuDiagnosticsSnapshot, now: Date, maximumAge: TimeInterval = 5,
+        isCurrentMenuProcess: (pid_t) -> Bool = { pid in
+            NSRunningApplication(processIdentifier: pid)?.bundleIdentifier == "org.damon.BitStreamManager"
+        }
+    ) -> Bool {
+        let age = now.timeIntervalSince(snapshot.snapshotAt)
+        return (0...maximumAge).contains(age) && isCurrentMenuProcess(snapshot.processIdentifier)
     }
 
     @MainActor
@@ -405,8 +430,11 @@ public enum DamonCLI {
         guard args.count == count else { throw CommandError("Unexpected arguments. Run 'RateCue --help' for usage.") }
     }
 
-    private static func printJSON(_ value: some Encodable) throws {
+    private static func printJSON(
+        _ value: some Encodable, dateEncodingStrategy: JSONEncoder.DateEncodingStrategy = .deferredToDate
+    ) throws {
         let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = dateEncodingStrategy
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         var data = try encoder.encode(value)
         data.append(0x0A)
