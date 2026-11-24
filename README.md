@@ -86,7 +86,7 @@ ratecue=./dist/RateCue.app/Contents/MacOS/RateCue
 
 The `menu-status` payload is versioned and reproducible. It includes the schema/model versions, prior percentages, unrounded 24-bit posterior, and ordered contributions—including the rate prior—showing every influence, candidate, strength label, provisional likelihood ratio, and signed log-odds effect. Redundant same-family evidence is retained diagnostically with a zero effect. **Advanced Diagnostics → Copy Diagnostics** renders the same complete contribution list rather than a summary-only subset.
 
-While Music is monitored, RateCue performs one bounded unified-log backfill per playback epoch. It reads current Music/Core Media decoder reports for sample rate and bit depth, with playback-position timing and reported-rate checks; failed reads stop after a retry budget. The parser is versioned and replay-tested, and accepted log evidence appears as `decoderLog` or `musicLog` with its actual contribution.
+While Music is monitored, RateCue performs one bounded unified-log backfill per playback epoch. It reads current Music/Core Media decoder reports for sample rate and bit depth, with playback-position timing and reported-rate checks; failed reads stop after a retry budget. A pause or idle interval retains the current track's original decoder-lifecycle anchor so resuming does not shift the log query by the paused wall-clock time; a replay from the beginning resets it. The parser is versioned and replay-tested, and accepted log evidence appears as `decoderLog` or `musicLog` with its actual contribution.
 
 For reproducible local input, generate the kit in a **new** directory:
 

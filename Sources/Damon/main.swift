@@ -52,6 +52,7 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var logEvidenceFailures = 0
     private var logEvidenceAttempts = 0
     private var logEvidenceStatus = "Not attempted"
+    private var logPlaybackAnchor = MusicPlaybackLogAnchor()
     private let menuDiagnostics = MenuDiagnosticsStore()
     private var lastMenuDiagnosticsAt = 0.0
     private var lastMenuDiagnosticsSignature: String?
@@ -137,7 +138,8 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let context = depthContext(for: previous) else { return }
         let selectedEpoch = epoch
         let elapsed = max(0, playback.position ?? now - playbackBoundary)
-        let estimatedStart = Date().addingTimeInterval(-elapsed)
+        let estimatedStart = logPlaybackAnchor.startedAt(for: trackID)
+            ?? Date().addingTimeInterval(-elapsed)
         lastLogEvidenceProbeAt = now
         logEvidenceAttempts += 1
         logEvidenceTask = Task { [weak self] in
@@ -216,6 +218,10 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             || previous?.playback?.state != sample.playback?.state
             || previous?.playback?.reportedRate != sample.playback?.reportedRate
             || previousMusicPID != pid || formatChanged || repeatOrSeek
+        logPlaybackAnchor.observe(
+            sample.playback, at: Date(),
+            restarted: repeatOrSeek || previousMusicPID != pid
+        )
         if previous?.playback?.reportedRate != sample.playback?.reportedRate {
             automaticPanelTask?.cancel()
             automaticPanelAttemptEpoch = nil

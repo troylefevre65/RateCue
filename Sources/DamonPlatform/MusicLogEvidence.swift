@@ -21,6 +21,37 @@ public struct MusicLogEvidence: Equatable, Sendable, Encodable {
     }
 }
 
+public struct MusicPlaybackLogAnchor: Sendable {
+    private var trackID: String?
+    private var startedAt: Date?
+    private var interrupted = false
+    private var lastPosition: Double?
+
+    public init() {}
+
+    public mutating func observe(_ playback: Playback?, at: Date, restarted: Bool = false) {
+        guard let playback else { return }
+        switch playback.state {
+        case .playing:
+            guard let trackID = playback.trackID, !trackID.isEmpty,
+                  let position = playback.position, position.isFinite, position >= 0 else { return }
+            let resumedFromBeginning = interrupted && position < 1 && (lastPosition ?? position) >= 1
+            if restarted || self.trackID != trackID || startedAt == nil || resumedFromBeginning {
+                self.trackID = trackID
+                startedAt = at.addingTimeInterval(-position)
+            }
+            lastPosition = position
+            interrupted = false
+        case .paused, .stopped:
+            interrupted = true
+        }
+    }
+
+    public func startedAt(for trackID: String) -> Date? {
+        self.trackID == trackID ? startedAt : nil
+    }
+}
+
 public enum MusicLogEvidenceReader {
     private final class ProcessDeadline: @unchecked Sendable {
         private let process: Process

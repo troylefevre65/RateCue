@@ -3,6 +3,61 @@ import Foundation
 import Testing
 
 struct MusicLogEvidenceTests {
+    @Test func playbackLogAnchorSurvivesPauseAndResetsOnTrackOrRestart() {
+        let startedAt = Date(timeIntervalSince1970: 1_700_000_000)
+        var anchor = MusicPlaybackLogAnchor()
+        anchor.observe(
+            Playback(state: .playing, trackID: "track", position: 12, file: nil, reportedRate: 44_100),
+            at: startedAt.addingTimeInterval(12)
+        )
+        #expect(anchor.startedAt(for: "track") == startedAt)
+
+        anchor.observe(
+            Playback(state: .paused, trackID: nil, position: nil, file: nil, reportedRate: nil),
+            at: startedAt.addingTimeInterval(312)
+        )
+        anchor.observe(
+            Playback(state: .playing, trackID: "track", position: 12, file: nil, reportedRate: 44_100),
+            at: startedAt.addingTimeInterval(312)
+        )
+        #expect(anchor.startedAt(for: "track") == startedAt)
+
+        anchor.observe(
+            Playback(state: .stopped, trackID: nil, position: nil, file: nil, reportedRate: nil),
+            at: startedAt.addingTimeInterval(612)
+        )
+        anchor.observe(
+            Playback(state: .playing, trackID: "track", position: 12, file: nil, reportedRate: 44_100),
+            at: startedAt.addingTimeInterval(612)
+        )
+        #expect(anchor.startedAt(for: "track") == startedAt)
+
+        let replayedAt = startedAt.addingTimeInterval(700)
+        anchor.observe(
+            Playback(state: .stopped, trackID: nil, position: nil, file: nil, reportedRate: nil),
+            at: replayedAt
+        )
+        anchor.observe(
+            Playback(state: .playing, trackID: "track", position: 0, file: nil, reportedRate: 44_100),
+            at: replayedAt.addingTimeInterval(20)
+        )
+        #expect(anchor.startedAt(for: "track") == replayedAt.addingTimeInterval(20))
+
+        let restartedAt = replayedAt.addingTimeInterval(100)
+        anchor.observe(
+            Playback(state: .playing, trackID: "track", position: 4, file: nil, reportedRate: 44_100),
+            at: restartedAt, restarted: true
+        )
+        #expect(anchor.startedAt(for: "track") == restartedAt.addingTimeInterval(-4))
+
+        anchor.observe(
+            Playback(state: .playing, trackID: "other", position: 8, file: nil, reportedRate: 96_000),
+            at: restartedAt.addingTimeInterval(10)
+        )
+        #expect(anchor.startedAt(for: "track") == nil)
+        #expect(anchor.startedAt(for: "other") == restartedAt.addingTimeInterval(2))
+    }
+
     private func json(_ message: String, timestamp: String = "2026-11-23 22:37:53.626941-0700") -> Data {
         let event: [String: String] = ["timestamp": timestamp, "eventMessage": message]
         return try! JSONSerialization.data(withJSONObject: [event])
