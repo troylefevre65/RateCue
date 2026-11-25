@@ -43,6 +43,8 @@ public struct MenuDiagnosticsSnapshot: Codable, Equatable, Sendable {
     public let playbackState: String?
     public let automaticPanelStatus: String?
     public let logEvidenceStatus: String
+    public let rateDetectionMilliseconds: Int?
+    public let depthDetectionMilliseconds: Int?
 
     public init(
         snapshotAt: Date, processIdentifier: Int32, menuTitle: String, certainty: String,
@@ -52,9 +54,10 @@ public struct MenuDiagnosticsSnapshot: Codable, Equatable, Sendable {
         publicationStatus: String = "priorOnly", posterior16: Int = 50, posterior24: Int = 50,
         evidenceAvailable: Bool = false, correlationModelVersion: Int = 1,
         prior16: Int = 50, prior24: Int = 50, unroundedProbability24: Double = 0.5,
-        contributions: [Contribution] = []
+        contributions: [Contribution] = [], rateDetectionMilliseconds: Int? = nil,
+        depthDetectionMilliseconds: Int? = nil
     ) {
-        self.schemaVersion = 1
+        self.schemaVersion = 2
         self.correlationModelVersion = correlationModelVersion
         self.snapshotAt = snapshotAt
         self.processIdentifier = processIdentifier
@@ -77,6 +80,8 @@ public struct MenuDiagnosticsSnapshot: Codable, Equatable, Sendable {
         self.playbackState = playbackState
         self.automaticPanelStatus = automaticPanelStatus
         self.logEvidenceStatus = logEvidenceStatus
+        self.rateDetectionMilliseconds = rateDetectionMilliseconds
+        self.depthDetectionMilliseconds = depthDetectionMilliseconds
     }
 }
 
@@ -84,10 +89,18 @@ public struct MenuDiagnosticsStore: Sendable {
     private let directory: URL
 
     public init(
-        directory: URL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-            .appendingPathComponent("RateCue", isDirectory: true)
+        directory: URL? = nil
     ) {
-        self.directory = directory
+        if let directory {
+            self.directory = directory
+        } else if let override = ProcessInfo.processInfo.environment["RATECUE_DIAGNOSTICS_DIR"],
+                  !override.isEmpty {
+            self.directory = URL(fileURLWithPath: override, isDirectory: true)
+        } else {
+            self.directory = FileManager.default.urls(
+                for: .applicationSupportDirectory, in: .userDomainMask
+            ).first!.appendingPathComponent("RateCue", isDirectory: true)
+        }
     }
 
     public var url: URL { directory.appendingPathComponent("menu-status.json") }

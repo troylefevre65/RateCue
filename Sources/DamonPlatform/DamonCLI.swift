@@ -145,7 +145,7 @@ public enum DamonCLI {
             case "menu-status":
                 try requireArgumentCount(args, 1)
                 let snapshot = try MenuDiagnosticsStore().read()
-                guard snapshot.schemaVersion == 1 else {
+                guard snapshot.schemaVersion == 2 else {
                     throw CommandError("Unsupported menu diagnostics schema \(snapshot.schemaVersion).", exitCode: 1)
                 }
                 guard validMenuSnapshot(snapshot, now: Date()) else {

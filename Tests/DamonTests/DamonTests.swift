@@ -449,7 +449,9 @@ struct DamonTests {
                     source: "musicPanel", candidate: 16, strength: "strong",
                     likelihoodRatio: 9, logOddsContribution: -2.197225
                 )
-            ]
+            ],
+            rateDetectionMilliseconds: 42,
+            depthDetectionMilliseconds: 2_750
         )
         let store = MenuDiagnosticsStore(directory: directory)
         try store.write(snapshot)
@@ -458,7 +460,9 @@ struct DamonTests {
         let json = try #require(String(data: data, encoding: .utf8))
         #expect(json.contains("\"posterior16\" : 95"))
         #expect(json.contains("\"correlationProvenance\" : ["))
-        #expect(json.contains("\"schemaVersion\" : 1"))
+        #expect(json.contains("\"schemaVersion\" : 2"))
+        #expect(json.contains("\"rateDetectionMilliseconds\" : 42"))
+        #expect(json.contains("\"depthDetectionMilliseconds\" : 2750"))
         #expect(json.contains("\"correlationModelVersion\" : 1"))
         #expect(json.contains("\"snapshotAt\" : \"2027-"))
         #expect(!json.contains("trackID"))

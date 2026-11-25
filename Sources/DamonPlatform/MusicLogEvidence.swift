@@ -21,6 +21,36 @@ public struct MusicLogEvidence: Equatable, Sendable, Encodable {
     }
 }
 
+public enum MusicLogProbeTiming {
+    public static let firstProbeDelay: TimeInterval = 0.1
+    public static let retryDelays: [TimeInterval] = [0, 0.25, 0.75, 1.5, 3, 6, 12]
+    public static let maximumAttempts = retryDelays.count + 1
+
+    public static func nextProbe(after completionAt: TimeInterval, attempts: Int) -> TimeInterval? {
+        guard attempts > 0, attempts <= retryDelays.count else { return nil }
+        return completionAt + retryDelays[attempts - 1]
+    }
+}
+
+public struct TransientPlaybackObservationHold: Sendable {
+    public static let limit = 2
+    private var misses = 0
+
+    public init() {}
+
+    public mutating func retainPrevious(
+        observedPlaybackAvailable: Bool, sameProcess: Bool, previousWasPlaying: Bool
+    ) -> Bool {
+        guard !observedPlaybackAvailable else {
+            misses = 0
+            return false
+        }
+        guard sameProcess, previousWasPlaying, misses < Self.limit else { return false }
+        misses += 1
+        return true
+    }
+}
+
 public struct MusicPlaybackLogAnchor: Sendable {
     private var trackID: String?
     private var startedAt: Date?

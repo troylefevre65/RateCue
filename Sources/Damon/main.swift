@@ -47,12 +47,15 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var panelSnapshot: PanelFormatSnapshot?
     private var depthCorrelation = BitDepthCorrelationEngine()
     private var logEvidenceTask: Task<Void, Never>?
-    private var lastLogEvidenceProbeAt = 0.0
+    private var nextLogEvidenceProbeAt = 0.0
     private var logEvidenceBackfilledEpoch: Epoch?
     private var logEvidenceFailures = 0
     private var logEvidenceAttempts = 0
     private var logEvidenceStatus = "Not attempted"
     private var logPlaybackAnchor = MusicPlaybackLogAnchor()
+    private var rateDetectionMilliseconds: Int?
+    private var depthDetectionMilliseconds: Int?
+    private var observationHold = TransientPlaybackObservationHold()
     private let menuDiagnostics = MenuDiagnosticsStore()
     private var lastMenuDiagnosticsAt = 0.0
     private var lastMenuDiagnosticsSignature: String?
@@ -107,9 +110,27 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             while let self, !Task.isCancelled {
                 let version = self.audioRefresh.version
                 await self.tick()
-                let interval = self.model.state == .aligning ? 50 :
-                    self.previous?.playback?.state == .playing ? 300 :
+                let pendingLogEvidence = self.automation
+                    && self.previous?.playback?.state == .playing
+                    && self.previous?.playback?.reportedRate != nil
+                    && self.logEvidenceBackfilledEpoch != self.epoch
+                    && self.logEvidenceAttempts < MusicLogProbeTiming.maximumAttempts
+                var logProbeWake: Int?
+                if pendingLogEvidence, self.logEvidenceTask == nil {
+                    let delay = self.nextLogEvidenceProbeAt - ProcessInfo.processInfo.systemUptime
+                    if delay < 0.3 {
+                        logProbeWake = max(20, Int((delay * 1_000).rounded(.up)))
+                    }
+                }
+                let interval = if self.model.state == .aligning {
+                    50
+                } else if let logProbeWake {
+                    logProbeWake
+                } else if self.previous?.playback?.state == .playing {
+                    300
+                } else {
                     self.automation && self.previous?.playback != nil ? 500 : 1_000
+                }
                 await self.audioRefresh.wait(since: version, milliseconds: interval)
             }
         }
@@ -130,8 +151,10 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func scheduleLogEvidenceRead() {
         let now = ProcessInfo.processInfo.systemUptime
-        guard logEvidenceTask == nil, now - lastLogEvidenceProbeAt >= 3,
-              logEvidenceBackfilledEpoch != epoch, logEvidenceAttempts < 5,
+        guard logEvidenceTask == nil,
+              now >= nextLogEvidenceProbeAt,
+              logEvidenceBackfilledEpoch != epoch,
+              logEvidenceAttempts < MusicLogProbeTiming.maximumAttempts,
               automation, let pid = previousMusicPID,
               let playback = previous?.playback, playback.state == .playing,
               let trackID = playback.trackID, let reportedRate = playback.reportedRate else { return }
@@ -140,7 +163,6 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let elapsed = max(0, playback.position ?? now - playbackBoundary)
         let estimatedStart = logPlaybackAnchor.startedAt(for: trackID)
             ?? Date().addingTimeInterval(-elapsed)
-        lastLogEvidenceProbeAt = now
         logEvidenceAttempts += 1
         logEvidenceTask = Task { [weak self] in
             let outcome = await Task.detached {
@@ -181,18 +203,23 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         + event.at.formatted(date: .omitted, time: .standard)
                 } else {
                     self.logEvidenceStatus = "No current rate-consistent decoder format event in backfill."
-                    if self.logEvidenceAttempts >= 5 {
+                    if self.logEvidenceAttempts >= MusicLogProbeTiming.maximumAttempts {
                         self.logEvidenceBackfilledEpoch = selectedEpoch
+                    } else if let next = MusicLogProbeTiming.nextProbe(
+                        after: ProcessInfo.processInfo.systemUptime, attempts: self.logEvidenceAttempts
+                    ) {
+                        self.nextLogEvidenceProbeAt = next
                     }
                 }
                 self.updateButton()
             case let .failure(error):
                 self.logEvidenceFailures += 1
-                self.lastLogEvidenceProbeAt = ProcessInfo.processInfo.systemUptime + (self.logEvidenceFailures == 1 ? 12 : 57)
+                self.nextLogEvidenceProbeAt = ProcessInfo.processInfo.systemUptime
+                    + (self.logEvidenceFailures == 1 ? 12 : 57)
                 let message = "Music log read failed: \(error.localizedDescription)"
                 self.logEvidenceStatus = message
                 self.appendLog(message)
-                if self.logEvidenceAttempts >= 5 {
+                if self.logEvidenceAttempts >= MusicLogProbeTiming.maximumAttempts {
                     self.logEvidenceBackfilledEpoch = selectedEpoch
                 }
             }
@@ -206,10 +233,22 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let folder = approvedFolder
         let generation = preferenceGeneration
         let audioVersion = audioRefresh.version
-        let sample = await Task.detached {
+        let observedSample = await Task.detached {
             PlaybackSample.collect(pid: pid, automation: enabled, folder: folder, includeRateEstimate: true)
         }.value
         guard !Task.isCancelled, reloadSettings(), generation == preferenceGeneration, audioVersion == audioRefresh.version else { return }
+        let holdPlayback = observationHold.retainPrevious(
+            observedPlaybackAvailable: observedSample.playback != nil,
+            sameProcess: pid != nil && pid == previousMusicPID,
+            previousWasPlaying: previous?.playback?.state == .playing
+        )
+        let sample: PlaybackSample
+        if holdPlayback, let previous {
+            appendLog("Holding current playback through transient Music observation failure")
+            sample = previous
+        } else {
+            sample = observedSample
+        }
         let formatChanged = previous?.format != sample.format
         let repeatOrSeek = if let old = previous?.playback?.position, let new = sample.playback?.position {
             old - new > 0.5 && new >= 0 && new < 1
@@ -246,13 +285,20 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             logEvidenceBackfilledEpoch = nil
             logEvidenceFailures = 0
             logEvidenceAttempts = 0
+            nextLogEvidenceProbeAt = playbackBoundary + MusicLogProbeTiming.firstProbeDelay
             logEvidenceStatus = "Waiting for current-track decoder evidence…"
+            rateDetectionMilliseconds = nil
+            depthDetectionMilliseconds = nil
         }
         appliedPreferenceGeneration = generation
         previous = sample
         previousDevice = preferred
         previousMusicPID = pid
         let now = ProcessInfo.processInfo.systemUptime
+        if rateDetectionMilliseconds == nil, sample.playback?.state == .playing,
+           sample.playback?.reportedRate != nil {
+            rateDetectionMilliseconds = max(0, Int(((now - playbackBoundary) * 1_000).rounded()))
+        }
         let evidence = sample.format.map { [Evidence(epoch: epoch, source: .musicMetadata, at: sample.at, format: $0)] } ?? []
         let resolution = Confidence.resolve(evidence, epoch: epoch, since: playbackBoundary, now: now)
         let routeConfirmed = preferred.map { sample.route == [$0.objectID] } ?? false
@@ -407,6 +453,11 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func updateButton() {
         guard let button = item.button else { return }
         let display = formatDisplay()
+        if depthDetectionMilliseconds == nil, display.format.depth != nil {
+            depthDetectionMilliseconds = max(
+                0, Int(((ProcessInfo.processInfo.systemUptime - playbackBoundary) * 1_000).rounded())
+            )
+        }
         let warning = [.unavailable, .failed, .drift, .unsupportedRate, .unsupportedRoute, .unavailableReadback].contains(model.state)
             || writeWarning != nil || verifier.outcome == .failed
         let title = if let panelPrompt {
@@ -464,13 +515,16 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     likelihoodRatio: $0.likelihoodRatio,
                     logOddsContribution: $0.logOddsContribution
                 )
-            } ?? []
+            } ?? [],
+            rateDetectionMilliseconds: rateDetectionMilliseconds,
+            depthDetectionMilliseconds: depthDetectionMilliseconds
         )
         let signature = "\(snapshot.menuTitle)|\(snapshot.certainty)|\(snapshot.posterior16)|\(snapshot.posterior24)|"
             + "\(snapshot.evidenceAvailable)|\(snapshot.correlationConflict)|\(snapshot.publicationStatus)|"
             + "\(snapshot.correlationProvenance.joined(separator: ","))|"
             + "\(snapshot.automaticPanelStatus ?? "")|\(snapshot.logEvidenceStatus)|"
             + "\(snapshot.playbackState ?? "")|"
+            + "\(snapshot.rateDetectionMilliseconds ?? -1)|\(snapshot.depthDetectionMilliseconds ?? -1)|"
             + "\(snapshot.contributions.map { "\($0.source):\($0.candidate ?? 0):\($0.logOddsContribution)" }.joined(separator: ","))"
         guard signature != lastMenuDiagnosticsSignature || now - lastMenuDiagnosticsWriteAt >= 2 else { return }
         do {
@@ -501,6 +555,12 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let trackDepth = display.format.depth.map { "\($0)-bit" } ?? "—"
         append("Track Format: \(trackRate) / \(trackDepth)")
         append("Evidence status: \(display.certainty.rawValue)")
+        append(
+            "Detection: rate "
+                + (rateDetectionMilliseconds.map { "\($0) ms" } ?? "—")
+                + "; depth "
+                + (depthDetectionMilliseconds.map { "\($0) ms" } ?? "—")
+        )
         append("Status: \(status(sample: sample))")
         append("Preferred Device: " + (preferred?.name ?? (preferredUID == nil ? "Not selected" : "Unavailable")))
         let active = sample?.activeOutputs ?? []
@@ -789,6 +849,8 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let text = """
             Track format: \(display.statusBarTitle(showRate: true, showDepth: true, warning: false).string)
             Evidence status: \(display.certainty.rawValue)
+            Rate detection: \(rateDetectionMilliseconds.map { "\($0) ms" } ?? "—")
+            Depth detection: \(depthDetectionMilliseconds.map { "\($0) ms" } ?? "—")
             Bit-depth posterior: \(depthDiagnosticText())
             Music monitoring: \(automation ? "on" : "off")
             Accessibility access: \(MusicFormatPanel.hasAccessibilityAccess ? "enabled" : "not enabled")
@@ -867,8 +929,13 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func scheduleAutomaticPanelRead() {
+        let logCollectionSettled = previous?.playback?.reportedRate == nil
+            || logEvidenceBackfilledEpoch == epoch
+            || (logEvidenceAttempts >= MusicLogProbeTiming.maximumAttempts && logEvidenceTask == nil)
+        let correlatedDepthAvailable = depthResolution(for: previous)?.candidate != nil
         guard settings.autoReadMusicPanel, automation, panelTask == nil, automaticPanelTask == nil,
-              panelSnapshot == nil,
+              panelSnapshot == nil, !correlatedDepthAvailable,
+              logCollectionSettled,
               automaticPanelAttemptEpoch != epoch
                 || automaticPanelRetryAt.map({ $0 <= ProcessInfo.processInfo.systemUptime }) == true,
               currentFormat.rate == nil, currentFormat.depth == nil,

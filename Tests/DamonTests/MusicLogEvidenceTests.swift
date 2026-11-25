@@ -3,6 +3,37 @@ import Foundation
 import Testing
 
 struct MusicLogEvidenceTests {
+    @Test func logProbeTimingPreservesFastPathAndLateCoverage() {
+        #expect(MusicLogProbeTiming.maximumAttempts == 8)
+        #expect(MusicLogProbeTiming.nextProbe(after: 10, attempts: 1) == 10)
+        #expect(MusicLogProbeTiming.nextProbe(after: 10, attempts: 2) == 10.25)
+        #expect(MusicLogProbeTiming.nextProbe(after: 10, attempts: 6) == 16)
+        #expect(MusicLogProbeTiming.nextProbe(after: 10, attempts: 7) == 22)
+        #expect(MusicLogProbeTiming.nextProbe(after: 10, attempts: 8) == nil)
+    }
+
+    @Test func transientObservationHoldKeepsAPlayingEpochTwice() {
+        var hold = TransientPlaybackObservationHold()
+        let first = hold.retainPrevious(observedPlaybackAvailable: false, sameProcess: true, previousWasPlaying: true)
+        let second = hold.retainPrevious(observedPlaybackAvailable: false, sameProcess: true, previousWasPlaying: true)
+        let third = hold.retainPrevious(observedPlaybackAvailable: false, sameProcess: true, previousWasPlaying: true)
+        let changedProcess = hold.retainPrevious(
+            observedPlaybackAvailable: false, sameProcess: false, previousWasPlaying: true
+        )
+        let recovered = hold.retainPrevious(
+            observedPlaybackAvailable: true, sameProcess: true, previousWasPlaying: true
+        )
+        let afterRecovery = hold.retainPrevious(
+            observedPlaybackAvailable: false, sameProcess: true, previousWasPlaying: true
+        )
+        #expect(first)
+        #expect(second)
+        #expect(!third)
+        #expect(!changedProcess)
+        #expect(!recovered)
+        #expect(afterRecovery)
+    }
+
     @Test func playbackLogAnchorSurvivesPauseAndResetsOnTrackOrRestart() {
         let startedAt = Date(timeIntervalSince1970: 1_700_000_000)
         var anchor = MusicPlaybackLogAnchor()
@@ -137,4 +168,5 @@ struct MusicLogEvidenceTests {
         let parsed = try MusicLogEvidenceReader.parse(data)
         #expect(parsed.map(\.depth) == [24, 16])
     }
+
 }
