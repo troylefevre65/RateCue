@@ -19,6 +19,96 @@ public struct MusicLogEvidence: Equatable, Sendable, Encodable {
         self.rate = rate
         self.depth = depth
     }
+
+    public func matches(
+        reportedRate: Int, estimatedStart: Date, maximumStartOffset: TimeInterval = 15
+    ) -> Bool {
+        source == .decoder
+            && [16, 24].contains(depth)
+            && rate == reportedRate
+            && playbackStartAt.map { abs($0.timeIntervalSince(estimatedStart)) <= maximumStartOffset } == true
+    }
+}
+
+public struct MusicLogPlaybackContext: Sendable {
+    private var trackID: String?
+    private var lastRate: Int?
+    public private(set) var previousRate: Int?
+    public private(set) var trackChanged = false
+
+    public init() {}
+
+    public mutating func observe(trackID: String?, rate: Int?) {
+        guard let trackID, !trackID.isEmpty else { return }
+        if self.trackID != trackID {
+            trackChanged = self.trackID != nil
+            previousRate = lastRate
+            self.trackID = trackID
+        } else if let rate, let lastRate, rate != lastRate {
+            previousRate = lastRate
+        }
+        if let rate {
+            lastRate = rate
+        }
+    }
+}
+
+/// Selects an unverified decoder lifecycle using playback timing and rate.
+public struct MusicLogLifecycleSelector: Sendable {
+    /// Bounds early lifecycles on same-rate track changes to reduce stale attribution.
+    public static let trackChangeEarlyStartLimit: TimeInterval = 5
+    /// The nearest lifecycle must beat every competitor by this margin.
+    public static let competingLifecycleMargin: TimeInterval = 3
+
+    public let reportedRate: Int
+    public let estimatedStart: Date
+    public let maximumStartOffset: TimeInterval
+    public let maximumEarlyStart: TimeInterval?
+
+    public init(
+        reportedRate: Int, estimatedStart: Date, maximumStartOffset: TimeInterval = 15,
+        maximumEarlyStart: TimeInterval? = nil
+    ) {
+        self.reportedRate = reportedRate
+        self.estimatedStart = estimatedStart
+        self.maximumStartOffset = maximumStartOffset
+        self.maximumEarlyStart = maximumEarlyStart
+    }
+
+    /// Track changes without a rate change limit early lifecycles; rate changes allow Music's
+    /// prebuffered lifecycle to start up to 30 s before the observed boundary.
+    public static func forEpoch(
+        reportedRate: Int, estimatedStart: Date, previousKnownRate: Int?, trackChanged: Bool
+    ) -> MusicLogLifecycleSelector {
+        let rateChanged = previousKnownRate.map { $0 != reportedRate } ?? false
+        return MusicLogLifecycleSelector(
+            reportedRate: reportedRate, estimatedStart: estimatedStart,
+            maximumStartOffset: rateChanged ? 30 : 15,
+            maximumEarlyStart: trackChanged && !rateChanged ? trackChangeEarlyStartLimit : nil
+        )
+    }
+
+    public func eligible(_ events: [MusicLogEvidence]) -> [MusicLogEvidence] {
+        events.filter { event in
+            guard event.matches(
+                reportedRate: reportedRate, estimatedStart: estimatedStart, maximumStartOffset: maximumStartOffset
+            ), let start = event.playbackStartAt else { return false }
+            return maximumEarlyStart.map { start >= estimatedStart.addingTimeInterval(-$0) } ?? true
+        }
+    }
+
+    public func select(from events: [MusicLogEvidence]) -> MusicLogEvidence? {
+        let lifecycles = Dictionary(grouping: eligible(events)) { $0.playbackStartAt! }
+            .map { (offset: abs($0.key.timeIntervalSince(estimatedStart)), reports: $0.value) }
+            .sorted { $0.offset < $1.offset }
+        guard let nearest = lifecycles.first else { return nil }
+        if lifecycles.count > 1,
+           lifecycles[1].offset - nearest.offset < Self.competingLifecycleMargin {
+            return nil
+        }
+        guard Set(nearest.reports.map(\.depth)).count == 1 else { return nil }
+        return nearest.reports.max { $0.at < $1.at }
+    }
 }
 
 public enum MusicLogProbeTiming {

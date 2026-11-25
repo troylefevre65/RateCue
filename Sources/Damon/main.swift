@@ -56,6 +56,7 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var rateDetectionMilliseconds: Int?
     private var depthDetectionMilliseconds: Int?
     private var observationHold = TransientPlaybackObservationHold()
+    private var logEvidenceContext = MusicLogPlaybackContext()
     private let menuDiagnostics = MenuDiagnosticsStore()
     private var lastMenuDiagnosticsAt = 0.0
     private var lastMenuDiagnosticsSignature: String?
@@ -163,6 +164,10 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let elapsed = max(0, playback.position ?? now - playbackBoundary)
         let estimatedStart = logPlaybackAnchor.startedAt(for: trackID)
             ?? Date().addingTimeInterval(-elapsed)
+        let selector = MusicLogLifecycleSelector.forEpoch(
+            reportedRate: reportedRate, estimatedStart: estimatedStart,
+            previousKnownRate: logEvidenceContext.previousRate, trackChanged: logEvidenceContext.trackChanged
+        )
         logEvidenceAttempts += 1
         logEvidenceTask = Task { [weak self] in
             let outcome = await Task.detached {
@@ -177,16 +182,7 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             switch outcome {
             case let .success(events):
                 self.logEvidenceFailures = 0
-                let eligible = events.filter { event in
-                    guard event.source == .decoder, let start = event.playbackStartAt else { return false }
-                    return abs(start.timeIntervalSince(estimatedStart)) <= 15
-                        && event.rate == reportedRate && [16, 24].contains(event.depth)
-                }
-                let event = eligible.min {
-                    let left = $0.playbackStartAt.map { abs($0.timeIntervalSince(estimatedStart)) } ?? .greatestFiniteMagnitude
-                    let right = $1.playbackStartAt.map { abs($0.timeIntervalSince(estimatedStart)) } ?? .greatestFiniteMagnitude
-                    return left < right
-                }
+                let event = selector.select(from: events)
                 if let event, let candidate = DepthCandidate(rawValue: event.depth) {
                     self.logEvidenceBackfilledEpoch = selectedEpoch
                     let source: DepthEvidenceSource = event.source == .decoder ? .decoderLog : .musicLog
@@ -249,6 +245,10 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             sample = observedSample
         }
+        if previousMusicPID != pid {
+            logEvidenceContext = MusicLogPlaybackContext()
+        }
+        logEvidenceContext.observe(trackID: sample.playback?.trackID, rate: sample.playback?.reportedRate)
         let formatChanged = previous?.format != sample.format
         let repeatOrSeek = if let old = previous?.playback?.position, let new = sample.playback?.position {
             old - new > 0.5 && new >= 0 && new < 1

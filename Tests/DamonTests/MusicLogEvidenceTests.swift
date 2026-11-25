@@ -12,6 +12,52 @@ struct MusicLogEvidenceTests {
         #expect(MusicLogProbeTiming.nextProbe(after: 10, attempts: 8) == nil)
     }
 
+    @Test func decoderEvidenceAllowsPrebufferedLifecycleWithinThirtySeconds() {
+        let start = Date(timeIntervalSince1970: 100)
+        let estimate = start.addingTimeInterval(16)
+        let report = MusicLogEvidence(
+            source: .decoder, at: start.addingTimeInterval(20), playbackStartAt: start,
+            rate: 96_000, depth: 24
+        )
+        #expect(!report.matches(reportedRate: 96_000, estimatedStart: estimate))
+        #expect(report.matches(reportedRate: 96_000, estimatedStart: estimate, maximumStartOffset: 30))
+        #expect(!report.matches(reportedRate: 44_100, estimatedStart: estimate))
+        #expect(!report.matches(reportedRate: 96_000, estimatedStart: start.addingTimeInterval(31)))
+        let otherLifecycle = MusicLogEvidence(
+            source: .decoder, at: start.addingTimeInterval(21),
+            playbackStartAt: start.addingTimeInterval(1), rate: 96_000, depth: 16
+        )
+        let selector = MusicLogLifecycleSelector(
+            reportedRate: 96_000, estimatedStart: estimate, maximumStartOffset: 30
+        )
+        #expect(selector.select(from: [report, otherLifecycle]) == nil)
+        #expect(selector.select(from: [report, report]) == report)
+    }
+
+    @Test func transitionContextRetainsPreviousRateThroughMissingSamples() {
+        var context = MusicLogPlaybackContext()
+        context.observe(trackID: "old", rate: 44_100)
+        context.observe(trackID: "new", rate: nil)
+        context.observe(trackID: nil, rate: nil)
+        context.observe(trackID: "new", rate: 96_000)
+        #expect(context.trackChanged)
+        #expect(context.previousRate == 44_100)
+        context.observe(trackID: "new", rate: 96_000)
+        #expect(context.previousRate == 44_100)
+        context.observe(trackID: "next", rate: 96_000)
+        #expect(context.previousRate == 96_000)
+    }
+
+    @Test func conflictingReportsForOneLifecycleAreNotSelected() {
+        let start = Date(timeIntervalSince1970: 100)
+        let first = MusicLogEvidence(source: .decoder, at: start, playbackStartAt: start, rate: 44_100, depth: 16)
+        let second = MusicLogEvidence(
+            source: .decoder, at: start.addingTimeInterval(1), playbackStartAt: start, rate: 44_100, depth: 24
+        )
+        let selector = MusicLogLifecycleSelector(reportedRate: 44_100, estimatedStart: start)
+        #expect(selector.select(from: [first, second]) == nil)
+    }
+
     @Test func transientObservationHoldKeepsAPlayingEpochTwice() {
         var hold = TransientPlaybackObservationHold()
         let first = hold.retainPrevious(observedPlaybackAvailable: false, sameProcess: true, previousWasPlaying: true)
