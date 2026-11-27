@@ -167,6 +167,65 @@ struct TrackTransitionRegressionTests {
         #expect(resumed.select(from: events)?.depth == 24)
     }
 
+    // Captured 2026-11-26: Back pressed twice. The first press restarts the 24-bit track (12:24:17.6),
+    // the second goes to the previous, 16-bit track (12:24:19.3). Music showed the new track from 12:24:18.6.
+    private static let backTwice: [Line] = [
+        .start("12:24:11.269", "0x7b0000a000|I/AAA.01"),
+        .report("12:24:11.309", "0x7b0000a000|I/AAA.01", rate: 44_100, depth: 24),
+        .start("12:24:17.647", "0x7b0000a000|I/AAA.01"),
+        .report("12:24:17.683", "0x7b0000a000|I/AAA.01", rate: 44_100, depth: 24),
+        .start("12:24:19.263", "0x7b0000b000|I/BBB.01"),
+        .report("12:24:19.297", "0x7b0000b000|I/BBB.01", rate: 44_100, depth: 16)
+    ]
+
+    @Test func backTwiceUsesWhatIsKnownAboutThePreviousTracksLifecycle() throws {
+        let events = try Self.parse(Self.backTwice)
+        var ledger = MusicLogLifecycleLedger()
+        let first = Self.selector(rate: 44_100, estimatedStart: "12:24:11.300", trackChanged: true)
+        #expect(first.select(from: Array(events.prefix(1)))?.depth == 24)
+        ledger.attribute(try #require(first.attributableLifecycle(from: Array(events.prefix(1)))), to: "old")
+
+        var back = Self.selector(rate: 44_100, estimatedStart: "12:24:18.600", trackChanged: true)
+        // Timing alone cannot tell the restart from the new track, and they disagree: withhold.
+        #expect(back.select(from: events) == nil)
+        #expect(back.attributableLifecycle(from: events) == nil)
+        back.excludedLifecycles = ledger.lifecycles(notBelongingTo: "new")
+        #expect(back.select(from: events)?.depth == 16)
+        #expect(back.attributableLifecycle(from: events)?.contains("BBB.01") == true)
+        // The same track is never excluded from its own lifecycle, and the ledger stays bounded.
+        #expect(ledger.lifecycles(notBelongingTo: "old").isEmpty)
+        for index in 0..<100 { ledger.attribute("L\(index)", to: "t\(index)") }
+        #expect(ledger.lifecycles(notBelongingTo: "new").count == MusicLogLifecycleLedger.capacity)
+    }
+
+    @Test func competingLifecyclesThatAgreeOnDepthPublishWithoutBeingAttributed() throws {
+        // Captured 2026-11-26 12:26: a restart and the previous track 1.9 s apart, both 16-bit.
+        let events = try Self.parse([
+            .start("12:26:00.476", "0x7b0000c000|I/CCC.01"),
+            .report("12:26:00.515", "0x7b0000c000|I/CCC.01", rate: 44_100, depth: 16),
+            .start("12:26:02.331", "0x7b0000d000|I/DDD.01"),
+            .report("12:26:02.372", "0x7b0000d000|I/DDD.01", rate: 44_100, depth: 16)
+        ])
+        let back = Self.selector(rate: 44_100, estimatedStart: "12:26:01.700", trackChanged: true)
+        #expect(back.select(from: events)?.depth == 16)
+        #expect(back.attributableLifecycle(from: events) == nil)
+    }
+
+    @Test func itemStartedEarlyIsAcceptedOnceItsReportArrivesAtTheBoundary() throws {
+        // Captured 2026-11-26: the next item's lifecycle started at 12:24:22 but it reported, and Music
+        // showed it as current, only at 12:24:36.
+        let events = try Self.parse([
+            .start("12:24:19.263", "0x7b0000b000|I/BBB.01"),
+            .report("12:24:19.297", "0x7b0000b000|I/BBB.01", rate: 44_100, depth: 16),
+            .start("12:24:22.076", "0x7b0000e000|I/AAA.02"),
+            .report("12:24:36.271", "0x7b0000e000|I/AAA.02", rate: 44_100, depth: 24)
+        ])
+        let next = Self.selector(rate: 44_100, estimatedStart: "12:24:36.000", trackChanged: true)
+        #expect(next.select(from: events)?.depth == 24)
+        // Before that report exists, the previous track's old report must not be borrowed.
+        #expect(next.select(from: Array(events.dropLast())) == nil)
+    }
+
     @Test func skipAnchorIgnoresStalePreviousTrackPosition() {
         let previousSampleAt = Self.date("13:34:28.500")
         let skipObservedAt = Self.date("13:34:28.700")

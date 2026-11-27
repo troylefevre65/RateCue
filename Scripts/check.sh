@@ -1,6 +1,7 @@
 #!/bin/sh
 # Usage: sh Scripts/check.sh
-# Validate, test, and rebuild dist/RateCue.app. Version and build come from Packaging/Info.plist.
+# Validate, test, and rebuild dist/RateCue.app (or RATECUE_BUILD_DIR/RateCue.app).
+# Version and build come from Packaging/Info.plist.
 set -eu
 
 cd "$(dirname "$0")/.."
@@ -11,8 +12,10 @@ fi
 
 plutil -lint Packaging/Info.plist Packaging/Damon.entitlements
 swift test
+python3 -m unittest discover -s Tests -p 'test_local_agent.py'
 sh Packaging/build-app.sh
-bundle=dist/RateCue.app/Contents
+bundle="${RATECUE_BUILD_DIR:-dist}/RateCue.app/Contents"
+test -x "$bundle/MacOS/RateCueMCP"
 "$bundle/MacOS/RateCue" --help > /dev/null
 name=$(plutil -extract CFBundleName raw -o - "$bundle/Info.plist")
 version=$(plutil -extract CFBundleShortVersionString raw -o - "$bundle/Info.plist")

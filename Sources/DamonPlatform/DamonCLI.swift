@@ -7,6 +7,7 @@ public enum DamonCLI {
     Usage: RateCue <command>
 
       --version                                    Show the application version and build.
+      --credits                                    Show the bundled credits and notices.
       devices                                      List Core Audio outputs as JSON.
       config show                                  Read RateCue preferences as JSON.
       config set [options]                         Update RateCue preferences.
@@ -16,9 +17,24 @@ public enum DamonCLI {
         --auto-switch <on|off>
         --show-rate <on|off>
         --show-depth <on|off>
+    --auto-read-panel <on|off>                 Experimental: lets the menu app operate Music's Lossless panel.
+    --camera-verification <on|off>             Does not request camera access; grant it in the menu first.
+    --relay-verification <on|off>              Does not request microphone access; grant it in the menu first.
       authorize-music                              Request Music Automation access explicitly.
       status                                       Read a fresh Music and device snapshot as JSON.
       menu-status                                  Read the running menu app's latest diagnostics.
+      assess-first-track <trace.json> [--deadline-ms <N>] [--timeline]
+                                                    Assess an exported trace offline; no live collection.
+      first-track-trace restart                    Restart capture in a trace-enabled menu app.
+      first-track-trace stop                       Stop capture and drop its buffer.
+      first-track-trace export [<output.json>]     Export that app's current trace to a file or stdout.
+      first-track-trace capture <output.json> [--deadline-ms <N>] [--timeout-s <N>]
+                                                    Restart, wait for playback to cover the deadline, export and assess.
+      app logs                                     Read the running menu app's session log.
+      app diagnostics                              Read its diagnostics text and access state.
+      app qualification-snapshot                   Read its qualification snapshot.
+      app login-item [status|on|off]               Read or change Launch at Login.
+      app quit                                     Quit the running menu app.
       log-format                                   Read current Music format events from unified logs.
       probe-format [--panel|--fresh-panel]         Read unqualified Music format evidence without switching.
       playback <play|pause|next>                   Send one playback command to the running Music app.
@@ -115,6 +131,9 @@ public enum DamonCLI {
             case "version", "--version":
                 try requireArgumentCount(args, 1)
                 print(try AppInformation().versionDescription)
+            case "credits", "--credits":
+                try requireArgumentCount(args, 1)
+                print(try AppInformation.credits())
             case "devices":
                 try requireArgumentCount(args, 1)
                 try printJSON(connectedDevices().map(DeviceInfo.init))
@@ -152,6 +171,105 @@ public enum DamonCLI {
                     throw CommandError("Menu diagnostics are stale or no longer belong to a running RateCue app.", exitCode: 1)
                 }
                 try printJSON(snapshot, dateEncodingStrategy: .iso8601)
+            case "assess-first-track":
+                let usage = "Use assess-first-track <trace.json> [--deadline-ms <1...120000>] [--timeline]."
+                guard args.count >= 2 else { throw CommandError(usage) }
+                var deadline = 10_000
+                var timeline = false
+                var options = args.dropFirst(2)
+                while let option = options.popFirst() {
+                    switch option {
+                    case "--timeline" where !timeline: timeline = true
+                    case "--deadline-ms":
+                        guard let value = options.popFirst().flatMap({ Int($0) }), (1...120_000).contains(value) else {
+                            throw CommandError("--deadline-ms must be an integer from 1 to 120000.")
+                        }
+                        deadline = value
+                    default: throw CommandError(usage)
+                    }
+                }
+                do {
+                    let trace = try FirstTrackTrace.read(from: URL(fileURLWithPath: args[1]))
+                    try printJSON(FirstTrackAssessment.assess(
+                        trace, deadlineMilliseconds: deadline, includeTimeline: timeline
+                    ))
+                } catch {
+                    throw CommandError("First-track trace is unreadable, oversized, malformed, or unsupported.", exitCode: 1)
+                }
+            case "first-track-trace":
+                let usage = "Use first-track-trace restart | stop | export [<output.json>] | "
+                    + "capture <output.json> [--deadline-ms <1...120000>] [--timeout-s <1...3600>]."
+                func save(_ trace: FirstTrackTrace, to path: String) throws {
+                    do { try trace.encoded().write(to: URL(fileURLWithPath: path), options: .atomic) } catch {
+                        throw CommandError("Could not write the trace to the selected file.", exitCode: 1)
+                    }
+                }
+                func trace(restart: Bool = false) throws -> FirstTrackTrace {
+                    do { return try FirstTrackTrace.request(restart: restart) } catch { throw appFailure(error) }
+                }
+                switch args.dropFirst().first {
+                case "restart" where args.count == 2:
+                    _ = try trace(restart: true)
+                    print("First-track capture restarted; waiting for playback.")
+                case "stop" where args.count == 2:
+                    _ = try appRequest(.traceStop)
+                    print("First-track capture stopped and its buffer dropped.")
+                case "export" where args.count <= 3:
+                    let trace = try trace()
+                    if args.count == 3 {
+                        try save(trace, to: args[2])
+                    } else {
+                        FileHandle.standardOutput.write(try trace.encoded() + Data([10]))
+                    }
+                case "capture" where args.count >= 3:
+                    var deadline = 10_000
+                    var timeout = 600
+                    var options = args.dropFirst(3)
+                    while let option = options.popFirst() {
+                        guard let value = options.popFirst().flatMap({ Int($0) }) else { throw CommandError(usage) }
+                        switch option {
+                        case "--deadline-ms" where (1...120_000).contains(value): deadline = value
+                        case "--timeout-s" where (1...3_600).contains(value): timeout = value
+                        default: throw CommandError(usage)
+                        }
+                    }
+                    var capture = try trace(restart: true)
+                    let giveUp = Date().addingTimeInterval(TimeInterval(timeout))
+                    while !capture.covers(deadlineMilliseconds: deadline) {
+                        guard Date() < giveUp else {
+                            throw CommandError(
+                                "Playback did not cover the deadline within \(timeout) s; nothing was written.", exitCode: 1
+                            )
+                        }
+                        Thread.sleep(forTimeInterval: 1)
+                        capture = try trace()
+                    }
+                    try save(capture, to: args[2])
+                    try printJSON(FirstTrackAssessment.assess(capture, deadlineMilliseconds: deadline))
+                default: throw CommandError(usage)
+                }
+            case "app":
+                let usage = "Use app logs | diagnostics | qualification-snapshot | login-item [status|on|off] | quit."
+                let action: AppExchange.Action
+                var argument: String?
+                switch (args.dropFirst().first, args.count) {
+                case ("logs", 2): action = .logs
+                case ("diagnostics", 2): action = .diagnostics
+                case ("qualification-snapshot", 2): action = .qualificationSnapshot
+                case ("quit", 2): action = .quit
+                case ("login-item", 2), ("login-item", 3):
+                    action = .loginItem
+                    argument = args.count == 3 ? args[2] : "status"
+                    guard AppExchange.Action.loginItem.arguments!.contains(argument!) else { throw CommandError(usage) }
+                default: throw CommandError(usage)
+                }
+                let result = try appRequest(action, argument: argument)
+                guard JSONSerialization.isValidJSONObject(result) else {
+                    throw CommandError("The RateCue menu app returned an invalid response.", exitCode: 1)
+                }
+                var data = try JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys])
+                data.append(10)
+                FileHandle.standardOutput.write(data)
             case "log-format":
                 try requireArgumentCount(args, 1)
                 try printJSON(MusicLogEvidenceReader.collect(last: 900), dateEncodingStrategy: .iso8601)
@@ -223,8 +341,8 @@ public enum DamonCLI {
             NSRunningApplication(processIdentifier: pid)?.bundleIdentifier == "org.damon.BitStreamManager"
         }
     ) -> Bool {
-        let age = now.timeIntervalSince(snapshot.snapshotAt)
-        return (0...maximumAge).contains(age) && isCurrentMenuProcess(snapshot.processIdentifier)
+        MenuDiagnosticsStore.isCurrent(snapshot, now: now, maximumAge: maximumAge,
+                                       isCurrentMenuProcess: isCurrentMenuProcess)
     }
 
     @MainActor
@@ -348,8 +466,11 @@ public enum DamonCLI {
     }
 
     static func configurationEdits(_ args: [String], devices: () throws -> [OutputDevice]) throws -> [SettingEdit] {
-        let options = try parseOptions(args, allowed: ["--device", "--local-audio", "--monitor-music", "--auto-switch", "--show-rate", "--show-depth"],
-                                       flags: ["--clear-local-audio"])
+        let options = try parseOptions(
+            args, allowed: ["--device", "--local-audio", "--monitor-music", "--auto-switch", "--show-rate", "--show-depth",
+                            "--auto-read-panel", "--camera-verification", "--relay-verification"],
+            flags: ["--clear-local-audio"]
+        )
         guard !options.isEmpty else { throw CommandError("Provide at least one option to 'config set'.") }
         guard options["--local-audio"] == nil || options["--clear-local-audio"] == nil else {
             throw CommandError("Use only one of --local-audio and --clear-local-audio.")
@@ -359,7 +480,10 @@ public enum DamonCLI {
             ("--monitor-music", SettingEdit.monitorMusic),
             ("--auto-switch", SettingEdit.autoSwitch),
             ("--show-rate", SettingEdit.showSampleRate),
-            ("--show-depth", SettingEdit.showBitDepth)
+            ("--show-depth", SettingEdit.showBitDepth),
+            ("--auto-read-panel", SettingEdit.autoReadMusicPanel),
+            ("--camera-verification", SettingEdit.cameraVerification),
+            ("--relay-verification", SettingEdit.relayVerification)
         ] {
             if let value = options[key] {
                 guard value == "on" || value == "off" else { throw CommandError("\(key) expects 'on' or 'off'.") }
@@ -424,6 +548,21 @@ public enum DamonCLI {
             throw CommandError("\(key) requires a positive integer.")
         }
         return value
+    }
+
+    private static func appFailure(_ error: Error) -> CommandError {
+        let message = switch error as? AppExchange.Failure {
+        case .traceDisabled: "The running RateCue menu app was not launched with RATECUE_FIRST_TRACK_TRACE=1."
+        case .traceStopped: "First-track capture is stopped. Run 'first-track-trace restart'."
+        case .musicUnavailable: "Music is not running or Automation access is unavailable."
+        case .noResponse: "No running RateCue menu app responded."
+        default: "The RateCue menu app could not complete the request."
+        }
+        return CommandError(message, exitCode: 1)
+    }
+
+    private static func appRequest(_ action: AppExchange.Action, argument: String? = nil) throws -> Any {
+        do { return try AppExchange.send(action, argument: argument) } catch { throw appFailure(error) }
     }
 
     private static func requireArgumentCount(_ args: [String], _ count: Int) throws {

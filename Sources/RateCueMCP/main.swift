@@ -1,0 +1,3 @@
+import RateCueMCPCore
+
+MCPServer.runStdio()

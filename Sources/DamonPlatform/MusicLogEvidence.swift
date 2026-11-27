@@ -11,13 +11,20 @@ public struct MusicLogEvidence: Equatable, Sendable, Encodable {
     public let playbackStartAt: Date?
     public let rate: Int
     public let depth: Int
+    /// Music's tag for one play instance of one queue item; process-local and never encoded.
+    public let lifecycle: String?
 
-    public init(source: Source, at: Date, playbackStartAt: Date? = nil, rate: Int, depth: Int) {
+    private enum CodingKeys: String, CodingKey { case source, at, playbackStartAt, rate, depth }
+
+    public init(
+        source: Source, at: Date, playbackStartAt: Date? = nil, rate: Int, depth: Int, lifecycle: String? = nil
+    ) {
         self.source = source
         self.at = at
         self.playbackStartAt = playbackStartAt
         self.rate = rate
         self.depth = depth
+        self.lifecycle = lifecycle
     }
 
     public func matches(
@@ -64,6 +71,8 @@ public struct MusicLogLifecycleSelector: Sendable {
     public let estimatedStart: Date
     public let maximumStartOffset: TimeInterval
     public let maximumEarlyStart: TimeInterval?
+    /// Lifecycles already attributed to a different track; they cannot belong to this one.
+    public var excludedLifecycles: Set<String> = []
 
     public init(
         reportedRate: Int, estimatedStart: Date, maximumStartOffset: TimeInterval = 15,
@@ -92,22 +101,54 @@ public struct MusicLogLifecycleSelector: Sendable {
         events.filter { event in
             guard event.matches(
                 reportedRate: reportedRate, estimatedStart: estimatedStart, maximumStartOffset: maximumStartOffset
-            ), let start = event.playbackStartAt else { return false }
-            return maximumEarlyStart.map { start >= estimatedStart.addingTimeInterval(-$0) } ?? true
+            ), event.playbackStartAt != nil else { return false }
+            if let lifecycle = event.lifecycle, excludedLifecycles.contains(lifecycle) { return false }
+            // Music can start a queued item early but reports its format when it begins rendering,
+            // so the report time, not the start time, bounds how stale a lifecycle may be.
+            return maximumEarlyStart.map { event.at >= estimatedStart.addingTimeInterval(-$0) } ?? true
         }
     }
 
-    public func select(from events: [MusicLogEvidence]) -> MusicLogEvidence? {
+    private func nearestLifecycles(_ events: [MusicLogEvidence]) -> [[MusicLogEvidence]] {
         let lifecycles = Dictionary(grouping: eligible(events)) { $0.playbackStartAt! }
             .map { (offset: abs($0.key.timeIntervalSince(estimatedStart)), reports: $0.value) }
             .sorted { $0.offset < $1.offset }
-        guard let nearest = lifecycles.first else { return nil }
-        if lifecycles.count > 1,
-           lifecycles[1].offset - nearest.offset < Self.competingLifecycleMargin {
-            return nil
-        }
-        guard Set(nearest.reports.map(\.depth)).count == 1 else { return nil }
-        return nearest.reports.max { $0.at < $1.at }
+        guard let nearest = lifecycles.first else { return [] }
+        return lifecycles.prefix { $0.offset - nearest.offset < Self.competingLifecycleMargin }.map(\.reports)
+    }
+
+    /// Lifecycles too close to tell apart are ambiguous only when they disagree about the depth.
+    public func select(from events: [MusicLogEvidence]) -> MusicLogEvidence? {
+        let competing = nearestLifecycles(events)
+        guard let nearest = competing.first,
+              Set(competing.joined().map(\.depth)).count == 1 else { return nil }
+        return nearest.max { $0.at < $1.at }
+    }
+
+    /// The lifecycle that can be recorded as this track's: only when no competitor was near it.
+    public func attributableLifecycle(from events: [MusicLogEvidence]) -> String? {
+        let competing = nearestLifecycles(events)
+        guard competing.count == 1, Set(competing[0].map(\.depth)).count == 1 else { return nil }
+        return competing[0].compactMap(\.lifecycle).first
+    }
+}
+
+/// Remembers which track each recently selected lifecycle belonged to, so that a restart of one
+/// track is not mistaken for the start of the next. An incorrect attribution may exclude valid evidence.
+public struct MusicLogLifecycleLedger: Sendable {
+    public static let capacity = 32
+    private var tracks: [(lifecycle: String, trackID: String)] = []
+
+    public init() {}
+
+    public mutating func attribute(_ lifecycle: String, to trackID: String) {
+        tracks.removeAll { $0.lifecycle == lifecycle }
+        tracks.append((lifecycle, trackID))
+        if tracks.count > Self.capacity { tracks.removeFirst(tracks.count - Self.capacity) }
+    }
+
+    public func lifecycles(notBelongingTo trackID: String) -> Set<String> {
+        Set(tracks.filter { $0.trackID != trackID }.map(\.lifecycle))
     }
 }
 
@@ -227,7 +268,7 @@ public enum MusicLogEvidenceReader {
                let lifecycleID, let start = starts[lifecycleID],
                at.timeIntervalSince(start) >= 0, at.timeIntervalSince(start) <= 90 {
                 return MusicLogEvidence(
-                    source: .decoder, at: at, playbackStartAt: start, rate: rate, depth: depth
+                    source: .decoder, at: at, playbackStartAt: start, rate: rate, depth: depth, lifecycle: lifecycleID
                 )
             }
             if let match = event.eventMessage.firstMatch(of: alternatePattern),
