@@ -43,6 +43,7 @@ public final class MCPServer: @unchecked Sendable {
     public typealias Reader = @Sendable (@Sendable () -> Bool) throws -> MenuDiagnosticsSnapshot
     private struct Arguments: @unchecked Sendable { let value: [String: Any] }
     private let tools: [MCPTool]
+    private let uptime: @Sendable () -> TimeInterval
     private let write: @Sendable (Data) -> Void
     private let lock = NSLock()
     private var state = 0 // 0: new, 1: awaiting initialized, 2: ready
@@ -52,8 +53,13 @@ public final class MCPServer: @unchecked Sendable {
     private var recent: [TimeInterval] = []
     private static let versions = ["2025-11-25", "2025-06-18"]
 
-    public init(tools: [MCPTool], write: @escaping @Sendable (Data) -> Void) {
+    public init(
+        tools: [MCPTool],
+        uptime: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+        write: @escaping @Sendable (Data) -> Void
+    ) {
         self.tools = tools
+        self.uptime = uptime
         self.write = write
     }
 
@@ -174,7 +180,7 @@ public final class MCPServer: @unchecked Sendable {
                 error(requestID, -32602, "Invalid arguments for this tool."); return
             }
             lock.lock()
-            let now = ProcessInfo.processInfo.systemUptime
+            let now = uptime()
             recent.removeAll { now - $0 >= 1 }
             guard !workerBusy else {
                 lock.unlock(); result(requestID, Self.toolError("Another request is in progress.")); return

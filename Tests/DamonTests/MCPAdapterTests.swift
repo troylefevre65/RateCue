@@ -16,6 +16,33 @@ private final class Messages: @unchecked Sendable {
     }
 }
 
+private final class TestClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: TimeInterval = 0
+    func now() -> TimeInterval {
+        lock.lock(); defer { lock.unlock() }; return value
+    }
+    func advance(_ seconds: TimeInterval) {
+        lock.lock(); value += seconds; lock.unlock()
+    }
+}
+
+private final class TestSignal: @unchecked Sendable {
+    private let lock = NSLock()
+    private var raised = false
+    func signal() {
+        lock.lock(); raised = true; lock.unlock()
+    }
+    func isRaised() -> Bool {
+        lock.lock(); defer { lock.unlock() }; return raised
+    }
+}
+
+private enum AdapterTestError: Error {
+    case timedOut(String), invalidReply(Int)
+}
+
+@Suite(.serialized)
 struct MCPAdapterTests {
     private func snapshot(status: String = "published", version: Int = 2) -> MenuDiagnosticsSnapshot {
         let noContext = status == "noContext"
@@ -151,9 +178,28 @@ struct MCPAdapterTests {
         send(server, ["jsonrpc": "2.0", "method": "notifications/initialized"])
     }
 
-    @Test func lifecycleDiscoveryErrorsAndCancellation() throws {
-        let entered = DispatchSemaphore(value: 0)
+    private func waitForSignal(_ signal: TestSignal) async throws {
+        let deadline = Date().addingTimeInterval(10)
+        repeat {
+            if signal.isRaised() { return }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        } while Date() < deadline
+        throw AdapterTestError.timedOut("worker entry")
+    }
+
+    private func waitForMessage(_ messages: Messages, id: Int) async throws -> [String: Any] {
+        let deadline = Date().addingTimeInterval(10)
+        repeat {
+            if let message = messages.all().first(where: { $0["id"] as? Int == id }) { return message }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        } while Date() < deadline
+        throw AdapterTestError.timedOut("response \(id)")
+    }
+
+    @Test func lifecycleDiscoveryErrorsAndCancellation() async throws {
+        let entered = TestSignal()
         let release = DispatchSemaphore(value: 0)
+        defer { release.signal() }
         let messages = Messages()
         let server = MCPServer(reader: { _ in
             entered.signal(); release.wait()
@@ -166,12 +212,12 @@ struct MCPAdapterTests {
                       "params": ["name": "ratecue_get_diagnostics", "arguments": ["path": "bad"]]])
         send(server, ["jsonrpc": "2.0", "id": 4, "method": "tools/call",
                       "params": ["name": "ratecue_get_diagnostics", "arguments": [:]]])
-        #expect(entered.wait(timeout: .now() + 1) == .success)
+        try await waitForSignal(entered)
         send(server, ["jsonrpc": "2.0", "id": 5, "method": "tools/call",
                       "params": ["name": "ratecue_get_diagnostics", "arguments": [:]]])
         send(server, ["jsonrpc": "2.0", "method": "notifications/cancelled", "params": ["requestId": 4]])
         release.signal()
-        Thread.sleep(forTimeInterval: 0.1)
+        try await Task.sleep(nanoseconds: 100_000_000)
         send(server, ["jsonrpc": "2.0", "id": 6, "method": "ping"])
         let all = messages.all()
         #expect((all[0]["error"] as? [String: Any])?["code"] as? Int == -32600)
@@ -187,18 +233,21 @@ struct MCPAdapterTests {
     }
 
     /// Calls one tool and returns its `result` object, or the JSON-RPC `error` object.
-    private func call(_ server: MCPServer, _ messages: Messages, _ name: String, _ arguments: [String: Any] = [:]) -> [String: Any] {
-        let before = messages.all().count
-        send(server, ["jsonrpc": "2.0", "id": before + 100, "method": "tools/call",
+    private func call(
+        _ server: MCPServer, _ messages: Messages, _ name: String, _ arguments: [String: Any] = [:]
+    ) async throws -> [String: Any] {
+        let id = messages.all().count + 100
+        send(server, ["jsonrpc": "2.0", "id": id, "method": "tools/call",
                       "params": ["name": name, "arguments": arguments]])
-        let until = Date().addingTimeInterval(2)
-        while messages.all().count == before && Date() < until { Thread.sleep(forTimeInterval: 0.002) }
-        Thread.sleep(forTimeInterval: 0.26)  // stay under the four-calls-per-second limit
-        let reply = messages.all().last ?? [:]
-        return reply["result"] as? [String: Any] ?? reply["error"] as? [String: Any] ?? [:]
+        let reply = try await waitForMessage(messages, id: id)
+        try await Task.sleep(nanoseconds: 260_000_000)  // stay under the four-calls-per-second limit
+        guard let result = reply["result"] as? [String: Any] ?? reply["error"] as? [String: Any] else {
+            throw AdapterTestError.invalidReply(id)
+        }
+        return result
     }
 
-    @Test func toolsetIsReadOnlyUnlessControlIsAllowedAndNeverReturnsIdentifiers() throws {
+    @Test func toolsetIsReadOnlyUnlessControlIsAllowedAndNeverReturnsIdentifiers() async throws {
         let domain = "org.damon.tests.\(UUID().uuidString)"
         let defaults = try #require(UserDefaults(suiteName: domain))
         defer { defaults.removePersistentDomain(forName: domain) }
@@ -251,19 +300,23 @@ struct MCPAdapterTests {
         let listed = names(readMessages, readOnly)
         #expect(listed.count == 4)
         #expect(listed.values.allSatisfy { $0 })
-        #expect(String(describing: call(readOnly, readMessages, "ratecue_playback", ["command": "play"])).contains("Invalid arguments"))
+        let unavailablePlayback = try await call(readOnly, readMessages, "ratecue_playback", ["command": "play"])
+        #expect(String(describing: unavailablePlayback).contains("Invalid arguments"))
         #expect(requests.all().isEmpty)
 
-        let settings = call(readOnly, readMessages, "ratecue_get_settings")["structuredContent"] as! [String: Any]
+        let settingsReply = try await call(readOnly, readMessages, "ratecue_get_settings")
+        let settings = try #require(settingsReply["structuredContent"] as? [String: Any])
         #expect(settings["preferredDeviceSelected"] as? Bool == true)
         #expect(settings["localAudioAuthorized"] as? Bool == true)
-        let qualification = call(readOnly, readMessages, "ratecue_get_qualification_snapshot")
-        #expect((qualification["structuredContent"] as! [String: Any])["activeOutputCount"] as? Int == 1)
-        let assessment = call(readOnly, readMessages, "ratecue_get_first_track_assessment", ["deadlineMilliseconds": 1])
-        let structured = assessment["structuredContent"] as! [String: Any]
+        let qualification = try await call(readOnly, readMessages, "ratecue_get_qualification_snapshot")
+        let qualificationContent = try #require(qualification["structuredContent"] as? [String: Any])
+        #expect(qualificationContent["activeOutputCount"] as? Int == 1)
+        let assessment = try await call(readOnly, readMessages, "ratecue_get_first_track_assessment", ["deadlineMilliseconds": 1])
+        let structured = try #require(assessment["structuredContent"] as? [String: Any])
         #expect(structured["ruleHypothesis"] as? String == "insufficientTrace")
         #expect((structured["timeline"] as? [String])?.isEmpty == false)
-        #expect(call(readOnly, readMessages, "ratecue_get_first_track_assessment", ["deadlineMilliseconds": true])["code"] as? Int == -32602)
+        let invalidDeadline = try await call(readOnly, readMessages, "ratecue_get_first_track_assessment", ["deadlineMilliseconds": true])
+        #expect(invalidDeadline["code"] as? Int == -32602)
         #expect(!String(describing: readMessages.all()).lowercased().contains("secret"))
 
         let controlMessages = Messages()
@@ -274,16 +327,23 @@ struct MCPAdapterTests {
             "ratecue_playback", "ratecue_restart_first_track_capture",
             "ratecue_set_preference", "ratecue_stop_first_track_capture"
         ])
-        let played = call(controlled, controlMessages, "ratecue_playback", ["command": "play"])["structuredContent"] as! [String: Any]
+        let playReply = try await call(controlled, controlMessages, "ratecue_playback", ["command": "play"])
+        let played = try #require(playReply["structuredContent"] as? [String: Any])
         #expect(played["confirmed"] as? Bool == false)
-        #expect(call(controlled, controlMessages, "ratecue_playback", ["command": "eject"])["code"] as? Int == -32602)
-        #expect(call(controlled, controlMessages, "ratecue_set_preference", ["name": "autoSwitch", "enabled": 1])["code"] as? Int == -32602)
-        #expect(call(controlled, controlMessages, "ratecue_set_preference", ["name": "preferredUID", "enabled": true])["code"] as? Int == -32602)
+        let invalidPlayback = try await call(controlled, controlMessages, "ratecue_playback", ["command": "eject"])
+        #expect(invalidPlayback["code"] as? Int == -32602)
+        let invalidBoolean = try await call(controlled, controlMessages, "ratecue_set_preference", ["name": "autoSwitch", "enabled": 1])
+        #expect(invalidBoolean["code"] as? Int == -32602)
+        let invalidPreference = try await call(controlled, controlMessages, "ratecue_set_preference", ["name": "preferredUID", "enabled": true])
+        #expect(invalidPreference["code"] as? Int == -32602)
         #expect(try !store.read().autoSwitch)
-        let changed = call(controlled, controlMessages, "ratecue_set_preference", ["name": "autoSwitch", "enabled": true])
-        #expect((changed["structuredContent"] as! [String: Any])["autoSwitch"] as? Bool == true)
+        let changed = try await call(controlled, controlMessages, "ratecue_set_preference", ["name": "autoSwitch", "enabled": true])
+        let changedContent = try #require(changed["structuredContent"] as? [String: Any])
+        #expect(changedContent["autoSwitch"] as? Bool == true)
         #expect(try store.read().autoSwitch)
-        #expect((call(controlled, controlMessages, "ratecue_stop_first_track_capture")["structuredContent"] as! [String: Any])["capturing"] as? Bool == false)
+        let stop = try await call(controlled, controlMessages, "ratecue_stop_first_track_capture")
+        let stopContent = try #require(stop["structuredContent"] as? [String: Any])
+        #expect(stopContent["capturing"] as? Bool == false)
         #expect(!String(describing: controlMessages.all()).lowercased().contains("secret"))
         #expect(requests.all().contains { $0["action"] as? String == "playback" && $0["argument"] as? String == "play" })
 
@@ -294,7 +354,7 @@ struct MCPAdapterTests {
             }), write: { offline.append($0) }
         )
         initialize(unavailable)
-        let failure = call(unavailable, offline, "ratecue_get_qualification_snapshot")
+        let failure = try await call(unavailable, offline, "ratecue_get_qualification_snapshot")
         #expect(failure["isError"] as? Bool == true)
         #expect(String(describing: failure).contains("No running RateCue menu app responded."))
     }
@@ -325,36 +385,45 @@ struct MCPAdapterTests {
         }
     }
 
-    @Test func successfulCallAndRateLimit() throws {
+    @Test func successfulCallAndRateLimit() async throws {
         let messages = Messages()
+        let clock = TestClock()
         let fixture = snapshot()
-        let server = MCPServer(reader: { _ in fixture }, write: { messages.append($0) })
+        let server = MCPServer(
+            tools: [MCPToolset.diagnostics(reader: { _ in fixture })],
+            uptime: { clock.now() }, write: { messages.append($0) }
+        )
         initialize(server)
+        var responses: [[String: Any]] = []
         for id in 2...6 {
             send(server, ["jsonrpc": "2.0", "id": id, "method": "tools/call",
                           "params": ["name": "ratecue_get_diagnostics", "arguments": [:]]])
-            let until = Date().addingTimeInterval(1)
-            while messages.all().count < id && Date() < until { Thread.sleep(forTimeInterval: 0.001) }
+            responses.append(try await waitForMessage(messages, id: id))
         }
-        let results = messages.all()
-        #expect(results.count == 6)
-        for result in results[1...4] {
-            let value = result["result"] as! [String: Any]
+        for result in responses.prefix(4) {
+            let value = try #require(result["result"] as? [String: Any])
             #expect(value["isError"] as? Bool == false)
-            let structured = value["structuredContent"] as! [String: Any]
-            let text = (value["content"] as! [[String: Any]])[0]["text"] as! String
-            let parsed = try JSONSerialization.jsonObject(with: Data(text.utf8)) as! [String: Any]
+            let structured = try #require(value["structuredContent"] as? [String: Any])
+            let content = try #require(value["content"] as? [[String: Any]])
+            let text = try #require(content.first?["text"] as? String)
+            let parsed = try #require(JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
             #expect(NSDictionary(dictionary: parsed).isEqual(to: structured))
         }
-        let limited = results[5]["result"] as! [String: Any]
+        let limited = try #require(responses[4]["result"] as? [String: Any])
         #expect(limited["isError"] as? Bool == true)
         #expect(String(describing: limited).contains("Rate limit"))
+        clock.advance(1)
+        send(server, ["jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                      "params": ["name": "ratecue_get_diagnostics", "arguments": [:]]])
+        let afterWindow = try await waitForMessage(messages, id: 7)
+        #expect((afterWindow["result"] as? [String: Any])?["isError"] as? Bool == false)
     }
 
-    @Test func timeoutDoesNotStartAnotherBlockedRead() {
+    @Test func timeoutDoesNotStartAnotherBlockedRead() async throws {
         let messages = Messages()
-        let entered = DispatchSemaphore(value: 0)
+        let entered = TestSignal()
         let release = DispatchSemaphore(value: 0)
+        defer { release.signal() }
         let server = MCPServer(reader: { _ in
             entered.signal(); release.wait()
             throw MenuDiagnosticsStore.ReadError.unreadable
@@ -362,15 +431,12 @@ struct MCPAdapterTests {
         initialize(server)
         send(server, ["jsonrpc": "2.0", "id": 2, "method": "tools/call",
                       "params": ["name": "ratecue_get_diagnostics"]])
-        #expect(entered.wait(timeout: .now() + 1) == .success)
-        let until = Date().addingTimeInterval(3)
-        while messages.all().count < 2 && Date() < until { Thread.sleep(forTimeInterval: 0.01) }
+        try await waitForSignal(entered)
+        let timedOut = try await waitForMessage(messages, id: 2)
         send(server, ["jsonrpc": "2.0", "id": 3, "method": "tools/call",
                       "params": ["name": "ratecue_get_diagnostics"]])
-        let responses = messages.all()
-        #expect(responses.count == 3)
-        #expect(String(describing: responses[1]).contains("timed out"))
-        #expect(String(describing: responses[2]).contains("in progress"))
-        release.signal()
+        let busy = try await waitForMessage(messages, id: 3)
+        #expect(String(describing: timedOut).contains("timed out"))
+        #expect(String(describing: busy).contains("in progress"))
     }
 }
