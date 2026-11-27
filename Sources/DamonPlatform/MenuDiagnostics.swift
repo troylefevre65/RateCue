@@ -1,4 +1,6 @@
 import Foundation
+import AppKit
+import Darwin
 
 public struct MenuDiagnosticsSnapshot: Codable, Equatable, Sendable {
     public struct Contribution: Codable, Equatable, Sendable {
@@ -104,6 +106,89 @@ public struct MenuDiagnosticsStore: Sendable {
     }
 
     public var url: URL { directory.appendingPathComponent("menu-status.json") }
+
+    public static var standardDirectory: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
+            .first!.appendingPathComponent("RateCue", isDirectory: true)
+    }
+
+    public static func isCurrent(
+        _ snapshot: MenuDiagnosticsSnapshot, now: Date, maximumAge: TimeInterval = 5,
+        isCurrentMenuProcess: (pid_t) -> Bool = { pid in
+            NSRunningApplication(processIdentifier: pid)?.bundleIdentifier == "org.damon.BitStreamManager"
+        }
+    ) -> Bool {
+        let age = now.timeIntervalSince(snapshot.snapshotAt)
+        return (0...maximumAge).contains(age) && snapshot.processIdentifier > 0
+            && isCurrentMenuProcess(snapshot.processIdentifier)
+    }
+
+    public enum ReadError: Error {
+        case missing, unsafeFile, oversized, unreadable, malformed, unsupportedSchema, stale, appUnavailable, cancelled
+    }
+
+    /// Reads a bounded regular file through a no-follow descriptor; never uses the environment override.
+    public static func readValidated(
+        directory: URL = standardDirectory, now: Date? = nil,
+        isCancelled: () -> Bool = { false },
+        isCurrentMenuProcess: (pid_t) -> Bool = { pid in
+            NSRunningApplication(processIdentifier: pid)?.bundleIdentifier == "org.damon.BitStreamManager"
+        }
+    ) throws -> MenuDiagnosticsSnapshot {
+        guard !isCancelled() else { throw ReadError.cancelled }
+        let directoryFD = open(directory.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard directoryFD >= 0 else {
+            if errno == ENOENT { throw ReadError.missing }
+            if errno == ELOOP || errno == ENOTDIR { throw ReadError.unsafeFile }
+            throw ReadError.unreadable
+        }
+        defer { close(directoryFD) }
+        let fd = openat(directoryFD, "menu-status.json", O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+        guard fd >= 0 else {
+            if errno == ENOENT { throw ReadError.missing }
+            if errno == ELOOP { throw ReadError.unsafeFile }
+            throw ReadError.unreadable
+        }
+        defer { close(fd) }
+        var info = stat()
+        guard fstat(fd, &info) == 0 else { throw ReadError.unreadable }
+        guard (info.st_mode & S_IFMT) == S_IFREG, info.st_uid == geteuid() else {
+            throw ReadError.unsafeFile
+        }
+        let limit = 64 * 1024
+        guard info.st_size <= limit else { throw ReadError.oversized }
+        var data = Data()
+        var buffer = [UInt8](repeating: 0, count: 4096)
+        while data.count <= limit {
+            guard !isCancelled() else { throw ReadError.cancelled }
+            let count = Darwin.read(fd, &buffer, min(buffer.count, limit + 1 - data.count))
+            if count == 0 { break }
+            if count < 0 {
+                if errno == EINTR { continue }
+                throw ReadError.unreadable
+            }
+            data.append(contentsOf: buffer.prefix(count))
+        }
+        guard data.count <= limit else { throw ReadError.oversized }
+        guard !isCancelled() else { throw ReadError.cancelled }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        struct Version: Decodable { let schemaVersion: Int }
+        let version: Version
+        do { version = try decoder.decode(Version.self, from: data) }
+        catch { throw ReadError.malformed }
+        guard version.schemaVersion == 2 else { throw ReadError.unsupportedSchema }
+        let snapshot: MenuDiagnosticsSnapshot
+        do { snapshot = try decoder.decode(MenuDiagnosticsSnapshot.self, from: data) }
+        catch { throw ReadError.malformed }
+        let age = (now ?? Date()).timeIntervalSince(snapshot.snapshotAt)
+        guard (0...5).contains(age) else { throw ReadError.stale }
+        guard !isCancelled() else { throw ReadError.cancelled }
+        guard snapshot.processIdentifier > 0, isCurrentMenuProcess(snapshot.processIdentifier) else {
+            throw ReadError.appUnavailable
+        }
+        return snapshot
+    }
 
     public func write(_ snapshot: MenuDiagnosticsSnapshot) throws {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

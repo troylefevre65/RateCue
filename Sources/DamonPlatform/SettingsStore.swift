@@ -9,6 +9,8 @@ public struct DamonSettings: Encodable, Equatable, Sendable {
     public var autoReadMusicPanel = false
     public var showSampleRate = true
     public var showBitDepth = true
+    public var cameraVerification = false
+    public var relayVerification = false
 
     public var authorizedAudio: URL? { authorizedAudioPath.map { URL(fileURLWithPath: $0) } }
 
@@ -27,9 +29,11 @@ public enum SettingEdit: Sendable {
     case autoReadMusicPanel(Bool)
     case showSampleRate(Bool)
     case showBitDepth(Bool)
+    case cameraVerification(Bool)
+    case relayVerification(Bool)
 }
 
-public struct SettingsStore {
+public struct SettingsStore: Sendable {
     private let domain: String
 
     public init(domain: String = "org.damon.BitStreamManager") {
@@ -43,7 +47,7 @@ public struct SettingsStore {
     public func read() throws -> DamonSettings {
         guard CFPreferencesAppSynchronize(domain as CFString) else { throw SyncError() }
         let keys = ["preferredUID", "approvedAudioPath", "approvedFolder", "observeMusic", "automatic",
-                    "autoReadMusicPanel", "showRate", "showDepth"]
+                    "autoReadMusicPanel", "showRate", "showDepth", "cameraVerification", "relayVerification"]
         let values = CFPreferencesCopyMultiple(keys as CFArray, domain as CFString,
                                                kCFPreferencesCurrentUser, kCFPreferencesAnyHost) as? [String: Any] ?? [:]
         var settings = DamonSettings()
@@ -58,6 +62,8 @@ public struct SettingsStore {
         settings.autoReadMusicPanel = values["autoReadMusicPanel"] as? Bool ?? false
         settings.showSampleRate = values["showRate"] as? Bool ?? true
         settings.showBitDepth = values["showDepth"] as? Bool ?? true
+        settings.cameraVerification = values["cameraVerification"] as? Bool ?? false
+        settings.relayVerification = values["relayVerification"] as? Bool ?? false
         return settings
     }
 
@@ -84,6 +90,8 @@ public struct SettingsStore {
             case let .autoReadMusicPanel(on): set("autoReadMusicPanel", on)
             case let .showSampleRate(on): set("showRate", on)
             case let .showBitDepth(on): set("showDepth", on)
+            case let .cameraVerification(on): set("cameraVerification", on)
+            case let .relayVerification(on): set("relayVerification", on)
             }
         }
         guard CFPreferencesAppSynchronize(domain as CFString) else { throw SyncError() }

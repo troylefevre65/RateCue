@@ -53,6 +53,7 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var logEvidenceAttempts = 0
     private var logEvidenceStatus = "Not attempted"
     private var logPlaybackAnchor = MusicPlaybackLogAnchor()
+    private var logLifecycleLedger = MusicLogLifecycleLedger()
     private var rateDetectionMilliseconds: Int?
     private var depthDetectionMilliseconds: Int?
     private var observationHold = TransientPlaybackObservationHold()
@@ -62,6 +63,10 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var lastMenuDiagnosticsSignature: String?
     private var lastMenuDiagnosticsWriteAt = 0.0
     private var menuDiagnosticsError: String?
+    private let firstTrackTraceEnabled = ProcessInfo.processInfo.environment["RATECUE_FIRST_TRACK_TRACE"] == "1"
+    private var firstTrackTrace: FirstTrackTraceRecorder?
+    private var tracedDisplay: String?
+    private var tracedAlignment: String?
     private var panelTask: Task<Void, Never>?
     private var panelPrompt: String?
     private var automaticPanelTask: Task<Void, Never>?
@@ -87,6 +92,11 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var profile: SensorProfile? { verificationProfiles.first { $0.deviceUID == preferredUID } }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if firstTrackTraceEnabled { restartFirstTrackTrace() }
+        DistributedNotificationCenter.default().addObserver(
+            self, selector: #selector(handleAppRequest(_:)),
+            name: AppExchange.notification, object: nil, suspensionBehavior: .deliverImmediately
+        )
         if let raw = Bundle.main.object(forInfoDictionaryKey: "DamonSensorProfiles") {
             do {
                 let data = try PropertyListSerialization.data(fromPropertyList: raw, format: .binary, options: 0)
@@ -164,11 +174,15 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let elapsed = max(0, playback.position ?? now - playbackBoundary)
         let estimatedStart = logPlaybackAnchor.startedAt(for: trackID)
             ?? Date().addingTimeInterval(-elapsed)
-        let selector = MusicLogLifecycleSelector.forEpoch(
+        var epochSelector = MusicLogLifecycleSelector.forEpoch(
             reportedRate: reportedRate, estimatedStart: estimatedStart,
             previousKnownRate: logEvidenceContext.previousRate, trackChanged: logEvidenceContext.trackChanged
         )
+        epochSelector.excludedLifecycles = logLifecycleLedger.lifecycles(notBelongingTo: trackID)
+        let selector = epochSelector
         logEvidenceAttempts += 1
+        let attempt = logEvidenceAttempts
+        trace(.probeStarted, epoch: selectedEpoch, attempt: attempt)
         logEvidenceTask = Task { [weak self] in
             let outcome = await Task.detached {
                 Result { try MusicLogEvidenceReader.collect(around: estimatedStart, radius: 30) }
@@ -178,11 +192,26 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             defer { self.audioRefresh.signal() }
             guard !Task.isCancelled, self.epoch == selectedEpoch, self.previousMusicPID == pid,
                   self.previous?.playback?.trackID == trackID,
-                  self.previous?.playback?.state == .playing else { return }
+                  self.previous?.playback?.state == .playing else {
+                self.trace(.probeCompleted, epoch: selectedEpoch, attempt: attempt, probeOutcome: .discarded)
+                return
+            }
             switch outcome {
             case let .success(events):
                 self.logEvidenceFailures = 0
                 let event = selector.select(from: events)
+                if let lifecycle = selector.attributableLifecycle(from: events) {
+                    self.logLifecycleLedger.attribute(lifecycle, to: trackID)
+                }
+                if self.firstTrackTrace != nil {
+                    self.trace(
+                        .probeCompleted, epoch: selectedEpoch, attempt: attempt,
+                        probeOutcome: event == nil ? .noSelection : .selected,
+                        parsedEventCount: events.count, eligibleEventCount: selector.eligible(events).count,
+                        selectedLogWallOffsetMilliseconds: event.flatMap { self.firstTrackTrace?.logWallOffset($0.at) },
+                        depth: event?.depth
+                    )
+                }
                 if let event, let candidate = DepthCandidate(rawValue: event.depth) {
                     self.logEvidenceBackfilledEpoch = selectedEpoch
                     let source: DepthEvidenceSource = event.source == .decoder ? .decoderLog : .musicLog
@@ -209,6 +238,7 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
                 self.updateButton()
             case let .failure(error):
+                self.trace(.probeCompleted, epoch: selectedEpoch, attempt: attempt, probeOutcome: .failed)
                 self.logEvidenceFailures += 1
                 self.nextLogEvidenceProbeAt = ProcessInfo.processInfo.systemUptime
                     + (self.logEvidenceFailures == 1 ? 12 : 57)
@@ -232,7 +262,14 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let observedSample = await Task.detached {
             PlaybackSample.collect(pid: pid, automation: enabled, folder: folder, includeRateEstimate: true)
         }.value
-        guard !Task.isCancelled, reloadSettings(), generation == preferenceGeneration, audioVersion == audioRefresh.version else { return }
+        let sampleAvailableAt = ProcessInfo.processInfo.systemUptime
+        guard !Task.isCancelled, reloadSettings(), generation == preferenceGeneration, audioVersion == audioRefresh.version else {
+            traceSample(
+                observedSample, availableAt: sampleAvailableAt, disposition: .discarded,
+                trackChanged: false, processChanged: pid != previousMusicPID
+            )
+            return
+        }
         let holdPlayback = observationHold.retainPrevious(
             observedPlaybackAvailable: observedSample.playback != nil,
             sameProcess: pid != nil && pid == previousMusicPID,
@@ -247,6 +284,7 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         if previousMusicPID != pid {
             logEvidenceContext = MusicLogPlaybackContext()
+            logLifecycleLedger = MusicLogLifecycleLedger()
         }
         logEvidenceContext.observe(trackID: sample.playback?.trackID, rate: sample.playback?.reportedRate)
         let formatChanged = previous?.format != sample.format
@@ -282,6 +320,7 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             } else { false }
             playbackBoundary = sample.at
             epoch = Epoch(playback: epoch.playback + (playbackChanged ? 1 : 0), route: epoch.route + (routeChanged ? 1 : 0))
+            trace(.epoch, epoch: epoch)
             logEvidenceBackfilledEpoch = nil
             logEvidenceFailures = 0
             logEvidenceAttempts = 0
@@ -290,6 +329,12 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             rateDetectionMilliseconds = nil
             depthDetectionMilliseconds = nil
         }
+        traceSample(
+            observedSample, availableAt: sampleAvailableAt, disposition: holdPlayback ? .retainedPrevious : .used,
+            trackChanged: !holdPlayback && previous?.playback?.trackID != nil
+                && sample.playback?.trackID != nil && previous?.playback?.trackID != sample.playback?.trackID,
+            processChanged: pid != previousMusicPID
+        )
         appliedPreferenceGeneration = generation
         previous = sample
         previousDevice = preferred
@@ -320,6 +365,7 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         currentFormat = resolution.format
         let request = model.step(alignmentInput(readback: preferred?.nominalRate), now: now)
+        traceAlignment()
         var verified: WriteRequest?
         var confirmedAt: TimeInterval?
         if let request {
@@ -365,6 +411,7 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         scheduleAutomaticPanelRead()
         scheduleLogEvidenceRead()
+        traceAlignment()
         updateButton()
     }
 
@@ -383,6 +430,13 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 || next.authorizedAudioPath != settings.authorizedAudioPath {
                 preferenceGeneration += 1
                 permissionMessage = nil
+            }
+            // Verification toggles can also arrive from `config set`; apply them as the menu would.
+            if next.cameraVerification != settings.cameraVerification
+                || next.relayVerification != settings.relayVerification {
+                preferenceGeneration += 1
+                if (settings.cameraVerification && !next.cameraVerification)
+                    || (settings.relayVerification && !next.relayVerification) { verifier.stop() }
             }
             if next.invalidatesAutomaticPanelRead(comparedTo: settings) {
                 automaticPanelTask?.cancel()
@@ -472,6 +526,83 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         button.toolTip = "\(display.certainty.rawValue) • \(status(sample: previous))\(correlation)"
         button.setAccessibilityLabel("RateCue: \(title.string). \(display.certainty.rawValue).")
         publishMenuDiagnostics(display: display, title: title.string)
+        if firstTrackTrace != nil {
+            let source: FirstTrackTrace.DepthSource? = switch display.certainty {
+            case .verified where display.format.depth != nil: .qualifiedLocal
+            case .panelSnapshot where display.format.depth != nil: .panel
+            case .correlated where display.format.depth != nil: .correlation
+            default: nil
+            }
+            let depth = source == nil ? nil : display.format.depth
+            let signature = "\(depth ?? 0)|\(source?.rawValue ?? "")|\(epoch.playback)|\(epoch.route)"
+            if signature != tracedDisplay {
+                tracedDisplay = signature
+                trace(.display, epoch: epoch, depth: depth, depthSource: source)
+            }
+        }
+    }
+
+    /// Records the existing alignment state when it changes; it never influences that state.
+    private func traceAlignment() {
+        guard firstTrackTrace != nil else { return }
+        let state: FirstTrackTrace.Alignment = switch model.state {
+        case .idle: .idle
+        case .unavailable: .unavailable
+        case .unknown: .unknown
+        case .unsupportedRoute: .unsupportedRoute
+        case .monitorOnly: .monitorOnly
+        case .unsupportedRate: .unsupportedRate
+        case .unavailableReadback: .unavailableReadback
+        case .off: .off
+        case .aligning: .aligning
+        case .aligned: .aligned
+        case .failed: .failed
+        case .drift: .drift
+        }
+        let target = currentFormat.rate.flatMap { (1...768_000).contains($0) ? $0 : nil }
+        let signature = "\(state.rawValue)|\(target ?? 0)|\(epoch.playback)|\(epoch.route)"
+        guard signature != tracedAlignment else { return }
+        tracedAlignment = signature
+        trace(.alignment, epoch: epoch, alignmentState: state, targetRateHz: target)
+    }
+
+    private func traceSample(
+        _ sample: PlaybackSample, availableAt: TimeInterval,
+        disposition: FirstTrackTrace.Disposition, trackChanged: Bool, processChanged: Bool
+    ) {
+        guard let recorder = firstTrackTrace else { return }
+        let state = sample.playback.flatMap { FirstTrackTrace.State(rawValue: $0.state.rawValue) } ?? .unavailable
+        trace(
+            .sample, epoch: epoch, collectionStartMilliseconds: recorder.milliseconds(at: sample.at),
+            availableAtMilliseconds: recorder.milliseconds(at: availableAt),
+            state: state, disposition: disposition, reportedRateHz: sample.playback?.reportedRate,
+            trackChanged: trackChanged, processChanged: processChanged
+        )
+    }
+
+    private func trace(
+        _ kind: FirstTrackTrace.Kind, epoch: Epoch, collectionStartMilliseconds: Int? = nil,
+        availableAtMilliseconds: Int? = nil,
+        state: FirstTrackTrace.State? = nil, disposition: FirstTrackTrace.Disposition? = nil,
+        reportedRateHz: Int? = nil, trackChanged: Bool? = nil, processChanged: Bool? = nil, attempt: Int? = nil,
+        probeOutcome: FirstTrackTrace.ProbeOutcome? = nil, parsedEventCount: Int? = nil,
+        eligibleEventCount: Int? = nil, selectedLogWallOffsetMilliseconds: Int? = nil,
+        depth: Int? = nil, depthSource: FirstTrackTrace.DepthSource? = nil,
+        alignmentState: FirstTrackTrace.Alignment? = nil, targetRateHz: Int? = nil
+    ) {
+        guard let recorder = firstTrackTrace else { return }
+        firstTrackTrace?.append(.init(
+            kind: kind, atMilliseconds: recorder.milliseconds(at: ProcessInfo.processInfo.systemUptime),
+            playbackGeneration: Int(epoch.playback), routeGeneration: Int(epoch.route),
+            collectionStartMilliseconds: collectionStartMilliseconds, availableAtMilliseconds: availableAtMilliseconds,
+            state: state,
+            disposition: disposition, reportedRateHz: reportedRateHz, trackChanged: trackChanged,
+            processChanged: processChanged,
+            attempt: attempt, probeOutcome: probeOutcome, parsedEventCount: parsedEventCount,
+            eligibleEventCount: eligibleEventCount,
+            selectedLogWallOffsetMilliseconds: selectedLogWallOffsetMilliseconds,
+            depth: depth, depthSource: depthSource, alignmentState: alignmentState, targetRateHz: targetRateHz
+        ))
     }
 
     private func publishMenuDiagnostics(display: FormatDisplay, title: String) {
@@ -681,6 +812,13 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         diagnostics.addItem(.separator())
         append("Logs…", action: #selector(showLogs), to: diagnostics)
         append("Copy Diagnostics", action: #selector(copyDiagnostics), to: diagnostics)
+        if firstTrackTraceEnabled {
+            if firstTrackTrace != nil {
+                append("Copy First-Track Trace (Experimental)", action: #selector(copyFirstTrackTrace), to: diagnostics)
+                append("Delete First-Track Trace / Stop Capture", action: #selector(deleteFirstTrackTrace), to: diagnostics)
+            }
+            append("Restart First-Track Capture", action: #selector(restartFirstTrackTrace), to: diagnostics)
+        }
         append("Qualification Snapshot…", action: #selector(showQualificationSnapshot), to: diagnostics)
         diagnostics.addItem(.separator())
         append("Choose Authorized Local Audio…", action: #selector(chooseLocalAudio), to: diagnostics)
@@ -844,9 +982,100 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             + "prior \(resolution.prior16)/\(resolution.prior24); contributions: \(contributions)"
     }
 
-    @objc private func copyDiagnostics() {
+    @objc private func deleteFirstTrackTrace() {
+        firstTrackTrace = nil
+    }
+
+    /// Explicit CLI, MCP or test-harness request. Every action mirrors a menu function, without its alerts.
+    @objc private func handleAppRequest(_ notification: Notification) {
+        guard let request = AppExchange.request(from: notification.userInfo) else { return }
+        func reply(_ result: Result<Any, AppExchange.Failure>) {
+            do { try AppExchange.respond(result, to: request.identifier) }
+            catch { appendLog("Could not answer an app request") }
+        }
+        switch request.action {
+        case .traceExport, .traceRestart, .traceStop:
+            guard firstTrackTraceEnabled else { reply(.failure(.traceDisabled)); return }
+            if request.action == .traceStop {
+                deleteFirstTrackTrace()
+                reply(.success(["stopped": true]))
+                return
+            }
+            if request.action == .traceRestart { restartFirstTrackTrace() }
+            guard let recorder = firstTrackTrace,
+                  let trace = try? recorder.snapshot(at: ProcessInfo.processInfo.systemUptime).exchangeObject() else {
+                reply(.failure(firstTrackTrace == nil ? .traceStopped : .failed))
+                return
+            }
+            reply(.success(trace))
+        case .logs:
+            reply(.success(["logs": logs]))
+        case .diagnostics:
+            reply(.success([
+                "text": diagnosticsText(), "accessibilityAccess": MusicFormatPanel.hasAccessibilityAccess,
+                "firstTrackTraceEnabled": firstTrackTraceEnabled, "firstTrackCaptureActive": firstTrackTrace != nil
+            ] as [String: Any]))
+        case .qualificationSnapshot:
+            let encoder = JSONEncoder()
+            encoder.dateEncodingStrategy = .iso8601
+            guard let data = try? encoder.encode(qualificationSnapshot()),
+                  let object = try? JSONSerialization.jsonObject(with: data) else { reply(.failure(.failed)); return }
+            reply(.success(object))
+        case .loginItem:
+            do {
+                if request.argument == "on" { try SMAppService.mainApp.register() }
+                if request.argument == "off" { try SMAppService.mainApp.unregister() }
+            } catch {
+                appendLog("Launch at Login: \(error.localizedDescription)")
+                reply(.failure(.failed))
+                return
+            }
+            let status = switch SMAppService.mainApp.status {
+            case .enabled: "enabled"
+            case .requiresApproval: "requiresApproval"
+            case .notRegistered: "notRegistered"
+            default: "notFound"
+            }
+            reply(.success(["status": status]))
+        case .playback:
+            guard let command = request.argument,
+                  let pid = NSRunningApplication.runningApplications(withBundleIdentifier: musicBundleID)
+                      .first?.processIdentifier else { reply(.failure(.musicUnavailable)); return }
+            Task {
+                let outcome = await Task.detached { MusicObserver.transport(command, pid: pid) }.value
+                reply(outcome.map { .success($0.object) } ?? .failure(.musicUnavailable))
+            }
+        case .quit:
+            reply(.success(["quitting": true]))
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { NSApp.terminate(nil) }
+        }
+    }
+
+    /// Drops any buffered trace and waits for the next accepted playing sample.
+    @objc private func restartFirstTrackTrace() {
+        guard firstTrackTraceEnabled else { return }
+        firstTrackTrace = FirstTrackTraceRecorder(startedAt: ProcessInfo.processInfo.systemUptime, wallStart: Date())
+        tracedDisplay = nil
+        tracedAlignment = nil
+    }
+
+    @objc private func copyFirstTrackTrace() {
+        guard let recorder = firstTrackTrace else { return }
+        do {
+            let data = try recorder.snapshot(at: ProcessInfo.processInfo.systemUptime).encoded()
+            guard let text = String(data: data, encoding: .utf8) else { return }
+            NSPasteboard.general.clearContents()
+            if !NSPasteboard.general.setString(text, forType: .string) {
+                alert("Could not copy first-track trace", detail: "The clipboard could not accept the trace.")
+            }
+        } catch {
+            alert("Could not export first-track trace", detail: "The bounded trace failed validation.")
+        }
+    }
+
+    private func diagnosticsText() -> String {
         let display = formatDisplay()
-        let text = """
+        return """
             Track format: \(display.statusBarTitle(showRate: true, showDepth: true, warning: false).string)
             Evidence status: \(display.certainty.rawValue)
             Rate detection: \(rateDetectionMilliseconds.map { "\($0) ms" } ?? "—")
@@ -858,16 +1087,19 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             Automatic depth: \(automaticPanelStatus ?? "No automatic check result")
             Status: \(status(sample: previous))
             """
+    }
+
+    @objc private func copyDiagnostics() {
         NSPasteboard.general.clearContents()
-        if !NSPasteboard.general.setString(text, forType: .string) {
+        if !NSPasteboard.general.setString(diagnosticsText(), forType: .string) {
             alert("Could not copy diagnostics", detail: "The clipboard could not accept the diagnostic text.")
         }
     }
 
-    @objc private func showQualificationSnapshot() {
+    private func qualificationSnapshot() -> QualificationSnapshot {
         let sample = appliedPreferenceGeneration == preferenceGeneration ? previous : nil
         let outputs = sample?.activeOutputs ?? []
-        let snapshot = QualificationSnapshot(
+        return QualificationSnapshot(
             status: sample == nil ? "No current observation" : status(sample: sample),
             music: sample?.message ?? "No observation yet",
             observationAgeMilliseconds: sample.map { Int(max(0, ProcessInfo.processInfo.systemUptime - $0.at) * 1_000) },
@@ -877,6 +1109,10 @@ private final class DamonApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             preferredDeviceRateHz: sample == nil ? nil : previousDevice?.nominalRate,
             autoSwitchEnabled: automatic
         )
+    }
+
+    @objc private func showQualificationSnapshot() {
+        let snapshot = qualificationSnapshot()
         let route = snapshot.activeOutputs.isEmpty ? "Unconfirmed" : snapshot.activeOutputs.joined(separator: ", ")
         let rate = snapshot.sourceRateHz.map { "\($0) Hz" } ?? "Unknown"
         let depth = snapshot.sourceBitDepth.map { "\($0)-bit" } ?? "Unknown"
