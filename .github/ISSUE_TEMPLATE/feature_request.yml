@@ -1,0 +1,22 @@
+name: Feature request
+description: Propose new evidence sources, automation, or display changes.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Every feature needs a CLI/API entry point usable by automation and the MCP adapter.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence and limits
+      description: How would the result be verified? What could make it wrong?

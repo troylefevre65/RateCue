@@ -353,6 +353,7 @@ The menu's **About RateCue**, **Help**, and **Credits** entries show the install
 - [Development and test plan](PLAN.md): CLI cookbook, lab procedures, measured results, and outstanding qualification gates.
 - [Proposed local agent and MCP adapter](MCP-SPECIFICATION.md): staged evaluation of diagnostics and format estimation, with a [development plan](MCP-PLAN.md).
 - [Contributing](CONTRIBUTING.md): development workflow and what to include in a report or proposed change.
+- [Security policy](SECURITY.md) and [code of conduct](CODE_OF_CONDUCT.md): private vulnerability reporting and participation expectations.
 
 ## License and credits
 

@@ -1,0 +1,47 @@
+name: Bug or detection report
+description: Report incorrect, slow, or missing rate or bit-depth detection, or another defect.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Redact track titles, personal paths, device UIDs, and credentials before submitting.
+        Report suspected vulnerabilities privately instead; see SECURITY.md.
+  - type: input
+    id: revision
+    attributes:
+      label: RateCue version or revision
+      description: Output of `ratecue --version`, or the git commit.
+    validations:
+      required: true
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version and Mac model
+    validations:
+      required: true
+  - type: input
+    id: output
+    attributes:
+      label: Output device and connection
+      description: For example "USB DAC model X" or "built-in speakers".
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected format and what RateCue displayed
+      description: Include the display color, rate, depth, and how long detection took.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Minimal steps to reproduce
+      description: For example "play album, press Back twice".
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: Paste "Advanced Diagnostics → Copy Diagnostics" output or a redacted first-track trace.
+      render: text
